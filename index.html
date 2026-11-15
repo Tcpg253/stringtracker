@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0d6b5f"><meta name="description" content="Personal badminton string inventory and stringing history.">
+  <link rel="manifest" href="manifest.webmanifest"><link rel="icon" href="icon.svg" type="image/svg+xml"><link rel="stylesheet" href="styles.css?v=2">
+  <title>StringTracker</title>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar"><a class="brand" href="#dashboard"><span class="brand-mark">S</span><span>String<span>Tracker</span></span></a>
+      <nav id="nav"><button class="nav-link active" data-page="dashboard">⌂ <span>Dashboard</span></button><button class="nav-link" data-page="rolls">◉ <span>My Rolls</span></button><button class="nav-link" data-page="history">◷ <span>Stringing History</span></button><button class="nav-link" data-page="statistics">◔ <span>Statistics</span></button><button class="nav-link" data-page="settings">⚙ <span>Settings</span></button></nav>
+      <div class="sidebar-bottom"><button id="themeToggle" class="plain-button">☾ <span>Dark mode</span></button><p>Private by design<br><small>Stored on this device</small></p></div>
+    </aside>
+    <main><header class="topbar"><button id="menuButton" class="icon-button mobile-only" aria-label="Menu">☰</button><div><p id="eyebrow">YOUR INVENTORY</p><h1 id="pageTitle">Dashboard</h1></div><div class="top-actions"><button id="installButton" class="secondary small hidden">Install app</button></div></header>
+      <div id="offlineStatus" class="offline hidden">You’re offline. Your data is safely available on this device.</div>
+      <div id="app"></div>
+    </main>
+  </div>
+  <nav id="mobileNav" aria-label="Mobile navigation"><button data-page="dashboard">⌂<span>Home</span></button><button data-page="rolls">◉<span>Rolls</span></button><button data-page="history">◷<span>History</span></button><button data-page="statistics">◔<span>Stats</span></button><button data-page="settings">⚙<span>Settings</span></button></nav>
+  <div id="modalRoot"></div><div id="toastRoot" aria-live="polite"></div>
+  <script src="app.js?v=2"></script>
+</body>
+</html>
