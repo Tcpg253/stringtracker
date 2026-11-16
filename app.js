@@ -1,119 +1,488 @@
 /* StringTracker: private, offline-first, no accounts or external services. */
-const DB_NAME='stringtracker-db', DB_VERSION=1;
-const METHODS={four:{id:'four',name:'YY',racketUnits:11,endUnits:2},two:{id:'two',name:'SZ',racketUnits:11.5,endUnits:0}};
-const DEFAULT_SETTINGS={defaultLength:200,racketLength:67.5,endLength:43,lowWarning:20,criticalWarning:10,defaultMethod:'four',theme:'light',lastBackupAt:null};
-let db, state={rolls:[],jobs:[],settings:{...DEFAULT_SETTINGS},page:'dashboard',selectedRoll:null}, deferredInstall;
-const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
-const escapeHtml=s=>String(s??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#039;','"':'&quot;'}[c]));
-const today=()=>new Date().toISOString().slice(0,10);
-const uid=p=>`${p}_${Date.now().toString(36)}${Math.random().toString(36).slice(2,6)}`;
-const n=v=>Number.parseFloat(v)||0;
-const fmt=v=>Number(v).toLocaleString(undefined,{maximumFractionDigits:4});
-const meters=v=>`${fmt(Math.max(0,v))}m`;
-const summaryMeters=v=>`${Number(Math.max(0,v)).toLocaleString(undefined,{maximumFractionDigits:2})}m`;
-const dateFmt=d=>d?new Date(`${d}T12:00:00`).toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'}):'—';
+const DB_NAME = 'stringtracker-db', DB_VERSION = 1;
+const METHODS = {
+  four: { name: 'YY', racketUnits: 11, endUnits: 2 },
+  two: { name: 'SZ', racketUnits: 11.5, endUnits: 0 },
+};
+const DEFAULT_SETTINGS = { defaultLength: 200, racketLength: 67.5, endLength: 43, lowWarning: 20, criticalWarning: 10, defaultMethod: 'four', theme: 'auto', lastBackupAt: null };
 
-function openDB(){return new Promise((resolve,reject)=>{const req=indexedDB.open(DB_NAME,DB_VERSION);req.onupgradeneeded=()=>{const d=req.result; if(!d.objectStoreNames.contains('rolls'))d.createObjectStore('rolls',{keyPath:'id'});if(!d.objectStoreNames.contains('jobs'))d.createObjectStore('jobs',{keyPath:'id'});if(!d.objectStoreNames.contains('settings'))d.createObjectStore('settings',{keyPath:'id'});};req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error);});}
-function tx(store,mode='readonly'){return db.transaction(store,mode).objectStore(store)}
-function getAll(store){return new Promise((resolve,reject)=>{const r=tx(store).getAll();r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error);});}
-function put(store,value){return new Promise((resolve,reject)=>{const r=tx(store,'readwrite').put(value);r.onsuccess=resolve;r.onerror=()=>reject(r.error);});}
-function remove(store,id){return new Promise((resolve,reject)=>{const r=tx(store,'readwrite').delete(id);r.onsuccess=resolve;r.onerror=()=>reject(r.error);});}
-function clearStore(store){return new Promise((resolve,reject)=>{const r=tx(store,'readwrite').clear();r.onsuccess=resolve;r.onerror=()=>reject(r.error);});}
-async function load(){state.rolls=await getAll('rolls');state.jobs=await getAll('jobs');const stored=await getAll('settings');state.settings={...DEFAULT_SETTINGS,...(stored[0]?.value||{})};setTheme(state.settings.theme);}
-async function saveSettings(){await put('settings',{id:'preferences',value:state.settings});}
-function consumption(key){const m=METHODS[key];return (m.racketUnits*state.settings.racketLength+m.endUnits*state.settings.endLength)/100;}
-function jobsFor(rollId){return state.jobs.filter(j=>j.rollId===rollId)}
-function used(rollId){return openingUsed(rollFor(rollId)||{})+jobsFor(rollId).reduce((sum,j)=>sum+n(j.consumption),0)}
-function plan(length){const a=consumption('four'),b=consumption('two');if(!(a>0&&b>0))return {four:0,two:0,total:0};const total=Math.floor((length+1e-9)/Math.min(a,b));const four=a>b?Math.max(0,Math.min(total,Math.floor((length-total*b+1e-9)/(a-b)))):total;return {four,two:total-four,total};}
-function openingUsed(r){return r.openingUsed==null&&n(r.originalLength)>0&&n(r.originalLength)<200?200-n(r.originalLength):n(r.openingUsed)}
-function original(r){return Math.max(200,n(r.originalLength))}
-function remaining(roll){return Math.max(0,original(roll)-used(roll.id))}
-function rollInfo(roll){const rem=remaining(roll),orig=original(roll),estimated=plan(openingUsed(roll)).total,count=jobsFor(roll.id).length;return {rem,used:used(roll.id),count,estimated,percent:rem/orig*100,...plan(rem)}}
-function activeRolls(){return state.rolls.filter(r=>!r.archived).sort((a,b)=>Number(a.empty)-Number(b.empty)||b.createdAt.localeCompare(a.createdAt))}
-function total(){return {rolls:state.rolls.length,remaining:state.rolls.reduce((x,r)=>x+remaining(r),0),consumed:state.jobs.reduce((x,j)=>x+n(j.consumption),0),jobs:state.jobs.length,low:activeRolls().filter(r=>{const a=remaining(r);return a>0&&a<state.settings.lowWarning}).length}}
-function warning(roll){const r=remaining(roll);if(r<=0)return 'empty';if(r<state.settings.criticalWarning)return 'critical';if(r<state.settings.lowWarning)return 'low';return ''}
+let db, deferredInstall, busy = false;
+const state = { rolls: [], jobs: [], settings: { ...DEFAULT_SETTINGS }, page: 'home', rollId: null, jobQuery: '', jobMethod: '' };
 
-function layout(){
-  const labels={dashboard:['STRINGTRACKER','Your string studio'],rolls:['INVENTORY','My rolls'],history:['RECORDS','Stringing history'],statistics:['INSIGHTS','Statistics'],settings:['PREFERENCES','Settings'],rollDetail:['INVENTORY','Roll details']};
-  const [eye,title]=labels[state.page]||labels.dashboard;
-  $('#eyebrow').textContent=eye; $('#pageTitle').textContent=title;
-  $$('[data-page]').forEach(b=>{const active=b.dataset.page===(state.page==='rollDetail'?'rolls':state.page);b.classList.toggle('active',active);if(active)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current');});
-  const views={dashboard,rolls,history,statistics,settings,rollDetail};
-  $('#app').innerHTML=(views[state.page]||dashboard)();bindPage();labelTableCells();
+/* ---------- helpers ---------- */
+const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+const esc = s => String(s ?? '').replace(/[&<>'"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#039;', '"': '&quot;' }[c]));
+const pad = v => String(v).padStart(2, '0');
+// Local calendar date (not UTC), so early-morning jobs get the right day.
+const today = () => { const d = new Date(); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
+const uid = p => `${p}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+const n = v => Number.parseFloat(v) || 0;
+const round4 = v => Math.round(v * 1e4) / 1e4;
+const num = v => Number(Math.max(0, v)).toLocaleString(undefined, { maximumFractionDigits: 2 });
+const meters = v => `${num(v)} m`;
+function dateFmt(d) {
+  if (!d) return '';
+  const date = new Date(`${d}T12:00:00`);
+  const opts = { month: 'short', day: 'numeric' };
+  if (date.getFullYear() !== new Date().getFullYear()) opts.year = 'numeric';
+  return date.toLocaleDateString(undefined, opts);
 }
-function labelTableCells(){
-  $$('.roll-table table').forEach(table=>{
-    const headers=[...table.querySelectorAll('thead th')].map(th=>th.textContent);
-    table.querySelectorAll('tbody tr').forEach(row=>[...row.cells].forEach((cell,i)=>{if(!cell.hasAttribute('colspan'))cell.dataset.label=headers[i]||'';}));
+const ICON = {
+  plus: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
+  back: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg>',
+  chevron: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>',
+};
+
+/* ---------- storage ---------- */
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = () => {
+      const d = req.result;
+      for (const s of ['rolls', 'jobs', 'settings']) if (!d.objectStoreNames.contains(s)) d.createObjectStore(s, { keyPath: 'id' });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
   });
 }
-function methodButtons(){
-  return '<button class="method-button" data-log="four"><strong>YY</strong><span>'+meters(consumption('four'))+' per racket</span></button><button class="method-button" data-log="two"><strong>SZ</strong><span>'+meters(consumption('two'))+' per racket</span></button>';
+const store = (name, mode = 'readonly') => db.transaction(name, mode).objectStore(name);
+const request = r => new Promise((resolve, reject) => { r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
+const getAll = name => request(store(name).getAll());
+const put = (name, value) => request(store(name, 'readwrite').put(value));
+const remove = (name, id) => request(store(name, 'readwrite').delete(id));
+const clearStore = name => request(store(name, 'readwrite').clear());
+async function load() {
+  state.rolls = await getAll('rolls');
+  state.jobs = await getAll('jobs');
+  const stored = await getAll('settings');
+  state.settings = { ...DEFAULT_SETTINGS, ...(stored[0]?.value || {}) };
+  applyTheme();
 }
-function empty(title,body,button=''){return `<div class="empty"><strong>${title}</strong>${body}${button?`<div style="margin-top:14px">${button}</div>`:''}</div>`}
-function rollSummary(r){const x=rollInfo(r);return `<article class="card compact-roll"><button class="roll-heading" data-roll="${r.id}"><span><strong>${escapeHtml(r.brand)} ${escapeHtml(r.model)}</strong>${r.color?`<small>${escapeHtml(r.color)}</small>`:''}</span><span class="compact-meters">${summaryMeters(x.rem)}<small>remaining ›</small></span></button><div class="progress"><span style="width:${x.percent}%"></span></div><div class="capacity-actions"><button data-instant="four" data-id="${r.id}" ${x.rem<consumption('four')?'disabled':''} aria-label="Log YY racket on ${escapeHtml(r.brand)} ${escapeHtml(r.model)}"><strong>${x.four}</strong> YY left</button><button data-instant="two" data-id="${r.id}" ${x.rem<consumption('two')?'disabled':''} aria-label="Log SZ racket on ${escapeHtml(r.brand)} ${escapeHtml(r.model)}"><strong>${x.two}</strong> SZ left</button></div></article>`}
-function dashboard(){return `<section class="roll-section"><div class="section-head"><h2>Your strings</h2><button class="primary" data-action="add-roll">＋ Add roll</button></div><div class="roll-list">${activeRolls().map(r=>rollSummary(r)).join('')||empty('Add your first roll','Your strings and quick logging buttons will appear here.')}</div></section>`;}
-function rolls(){const active=activeRolls(), archived=state.rolls.filter(r=>r.archived);return `<div class="toolbar"><div class="filters"><input class="input" id="rollSearch" placeholder="Search brand, model or ID"><select id="rollStatus"><option value="active">Active rolls</option><option value="all">All rolls</option><option value="archived">Archived</option></select></div><button class="primary" data-action="add-roll">＋ Add new roll</button></div><div class="card roll-table"><table><thead><tr><th>STRING ROLL</th><th>REMAINING</th><th>USAGE</th><th>CAPACITY</th><th>STATUS</th><th></th></tr></thead><tbody id="rollRows">${rollRows(active)}</tbody></table></div>${archived.length?`<p style="color:var(--muted);font-size:12px;margin-top:12px">${archived.length} archived roll${archived.length===1?'':'s'} retained with their full history.</p>`:''}`}
-function rollRows(list){return list.length?list.map(r=>{const x=rollInfo(r),w=warning(r);return `<tr><td><div class="table-name">${escapeHtml(r.brand)} ${escapeHtml(r.model)}</div><div class="roll-id">${escapeHtml(r.rollCode)}${r.color?` · ${escapeHtml(r.color)}`:''}</div></td><td><strong class="${w==='empty'?'danger-text':w?'warning':''}">${meters(x.rem)}</strong><span style="color:var(--muted);font-size:11px"> / ${meters(original(r))}</span><div class="progress" style="width:105px"><span style="width:${x.percent}%"></span></div></td><td>${x.count} logged${x.estimated?` · ~${x.estimated} earlier`:""}<div class="roll-id">${meters(x.used)} used</div></td><td><span class="pill">${x.four} / ${x.two}</span><div class="roll-id">YY / SZ</div></td><td>${r.archived?'<span class="pill">Archived</span>':w?`<span class="pill ${w==='empty'?'empty':'low'}">${w==='empty'?'Empty':w==='critical'?'Critical':'Low'}</span>`:'<span class="pill">Healthy</span>'}</td><td><button class="action-link" data-roll="${r.id}">View</button></td></tr>`}).join(''):`<tr><td colspan="6">${empty('No rolls in this view','Try a different filter or add a new roll.')}</td></tr>`}
-function rollFor(id){return state.rolls.find(r=>r.id===id)}function methodName(k){return METHODS[k]?.name||k}
-function history(){const rolls=state.rolls;return `<div class="toolbar"><div class="filters"><input class="input" id="jobSearch" placeholder="Search strings, rackets, notes"><select id="jobRoll"><option value="">All rolls</option>${rolls.map(r=>`<option value="${r.id}">${escapeHtml(r.brand)} ${escapeHtml(r.model)}</option>`).join('')}</select><select id="jobMethod"><option value="">All methods</option><option value="four">YY</option><option value="two">SZ</option></select><input type="date" id="jobDate" title="Filter by date"></div><div class="method-pair"><button class="secondary small" data-log="four">＋ YY</button><button class="secondary small" data-log="two">＋ SZ</button></div></div><div class="card roll-table history-card"><table><thead><tr><th>DATE & STRING</th><th>METHOD / TENSION</th><th></th></tr></thead><tbody id="jobRows">${jobRows(state.jobs)}</tbody></table></div>`}
-function jobRows(list){list=[...list].sort((a,b)=>b.date.localeCompare(a.date)||b.createdAt.localeCompare(a.createdAt));return list.length?list.map(j=>{const r=rollFor(j.rollId);return `<tr><td><span class="history-date">${dateFmt(j.date)}</span><strong class="history-string">${escapeHtml(r?`${r.brand} ${r.model}`:'Unknown roll')}</strong></td><td><span class="pill">${j.method==='four'?'YY':'SZ'}</span>${j.tension?`<small class="history-tension">${escapeHtml(j.tension)}</small>`:''}</td><td><button class="action-link" data-edit-job="${j.id}">Edit</button><button class="action-link" data-delete-job="${j.id}" aria-label="Delete stringing on ${escapeHtml(j.date)}">×</button></td></tr>`}).join(''):`<tr><td colspan="3">${empty('No matching jobs','Your completed rackets appear here.')}</td></tr>`}
-function statistics(){const t=total(), four=state.jobs.filter(j=>j.method==='four').length,two=state.jobs.filter(j=>j.method==='two').length;const popular=most(state.jobs.map(j=>{const r=rollFor(j.rollId);return r?`${r.brand} ${r.model}`:''}).filter(Boolean));const rackets=most(state.jobs.map(j=>`${j.racketBrand||''} ${j.racketModel||''}`.trim()).filter(Boolean));const byRoll=state.rolls.map(r=>({name:r.rollCode,value:used(r.id)})).filter(x=>x.value);const days=Object.entries(state.jobs.reduce((o,j)=>{o[j.date]=(o[j.date]||0)+1;return o},{})).slice(-8);return `<section class="stat-grid"><div class="card stat"><div class="stat-label">TOTAL RACKETS</div><div class="stat-value">${t.jobs}</div></div><div class="card stat"><div class="stat-label">METERS CONSUMED</div><div class="stat-value">${summaryMeters(t.consumed)}</div></div><div class="card stat"><div class="stat-label">AVERAGE / RACKET</div><div class="stat-value">${t.jobs?summaryMeters(t.consumed/t.jobs):'—'}</div></div><div class="card stat"><div class="stat-label">YY</div><div class="stat-value">${four}</div></div><div class="card stat"><div class="stat-label">SZ</div><div class="stat-value">${two}</div></div></section><div class="chart-grid"><div class="card chart-card"><h2>At a glance</h2><div class="kv"><span>Most used string</span><strong>${escapeHtml(popular||'—')}</strong></div><div class="kv"><span>Most used racket</span><strong>${escapeHtml(rackets||'—')}</strong></div><div class="kv"><span>Active rolls</span><strong>${activeRolls().length}</strong></div><div class="kv"><span>Rolls completed</span><strong>${state.rolls.filter(r=>remaining(r)<=0).length}</strong></div></div></div>`}
-function most(list){const m={};list.forEach(x=>m[x]=(m[x]||0)+1);return Object.entries(m).sort((a,b)=>b[1]-a[1])[0]?.[0]}
-function bars(items,suffix){if(!items.length)return empty('Nothing to chart yet','Complete a stringing job to see your trends.');const max=Math.max(...items.map(i=>i.value),1);return `<div class="bar-chart">${items.map(i=>`<div class="bar-wrap" title="${escapeHtml(i.name)}: ${fmt(i.value)}${suffix}"><div class="bar" style="height:${i.value/max*100}%"></div><span class="bar-label">${escapeHtml(i.name)}</span></div>`).join('')}</div>`}
-function settings(){const s=state.settings;return `<div class="settings"><section class="card settings-card"><h2>Calculations</h2><p>These measurements determine future jobs. Existing history retains the exact amount that was deducted.</p><form id="settingsForm"><div class="form-grid"><label class="field">Default roll length (m)<input type="number" min="1" step="0.01" name="defaultLength" value="${s.defaultLength}"></label><label class="field">Default method<select name="defaultMethod"><option value="four" ${s.defaultMethod==='four'?'selected':''}>Yonex 4-Knot</option><option value="two" ${s.defaultMethod==='two'?'selected':''}>SZ 2-Knot</option></select></label><label class="field">Racket length (cm)<input type="number" min="1" step="0.01" name="racketLength" value="${s.racketLength}"></label><label class="field">End-to-T-head length (cm)<input type="number" min="0" step="0.01" name="endLength" value="${s.endLength}"></label></div><div class="notice" style="margin-top:15px">Yonex 4-Knot: <strong>${meters(consumption('four'))}</strong> per racket · SZ 2-Knot: <strong>${meters(consumption('two'))}</strong> per racket</div><div class="modal-footer"><button class="primary">Save calculation settings</button></div></form></section><section class="card settings-card"><h2>Warnings & appearance</h2><p>Low inventory warnings show on the dashboard. Your color preference is saved locally.</p><form id="appearanceForm"><div class="form-grid"><label class="field">Low-string warning (m)<input type="number" min="0" step="0.1" name="lowWarning" value="${s.lowWarning}"></label><label class="field">Critical warning (m)<input type="number" min="0" step="0.1" name="criticalWarning" value="${s.criticalWarning}"></label><label class="field">Theme<select name="theme"><option value="light" ${s.theme==='light'?'selected':''}>Light</option><option value="dark" ${s.theme==='dark'?'selected':''}>Dark</option></select></label></div><div class="modal-footer"><button class="primary">Save preferences</button></div></form></section><section class="card settings-card"><h2>Data safety & backup</h2><p>Everything is automatically stored in IndexedDB on this device. It does not automatically sync to another phone or computer—export a JSON backup to transfer it.</p><div class="settings-actions"><button class="secondary" data-action="export">Export JSON backup</button><button class="secondary" data-action="import">Import JSON backup</button><input id="importFile" type="file" accept="application/json,.json" class="hidden"><button class="danger" data-action="reset">Reset all data</button></div>${s.lastBackupAt?`<p style="margin-top:14px;font-size:12px">Last backup export: ${dateFmt(s.lastBackupAt)}</p>`:''}</section><section class="card settings-card"><h2>Install and work offline</h2><p>After the first load, this app caches its core files for offline use. Use your browser’s “Install app” or “Add to Home Screen” option. On iPhone/iPad, open in Safari, tap Share, then Add to Home Screen.</p></section></div>`}
-function rollDetail(){const r=rollFor(state.selectedRoll);if(!r){state.page='rolls';return rolls()}const x=rollInfo(r), jobs=jobsFor(r.id).sort((a,b)=>b.date.localeCompare(a.date));const four=jobs.filter(j=>j.method==='four').length,two=jobs.filter(j=>j.method==='two').length;return `<div class="toolbar"><button class="secondary small" data-page="rolls">← All rolls</button><div><button class="secondary small" data-edit-roll="${r.id}">Edit</button> <button class="secondary small" data-toggle-archive="${r.id}">${r.archived?'Restore':'Archive'}</button></div></div><div class="details-grid"><section class="card detail-card"><div class="section-head"><div><h3>${escapeHtml(r.brand)} ${escapeHtml(r.model)}</h3><p>${escapeHtml(r.rollCode)}${r.color?` · ${escapeHtml(r.color)}`:''}</p></div><strong class="${warning(r)?'warning':''}">${meters(x.rem)} left</strong></div><div class="progress"><span style="width:${x.percent}%"></span></div><div class="kv"><span>Original length</span><strong>${meters(original(r))}</strong></div><div class="kv"><span>Consumed</span><strong>${meters(x.used)}</strong></div><div class="kv"><span>Completed rackets</span><strong>${x.count} logged${x.estimated?` + ~${x.estimated} estimated earlier`:""}</strong></div><div class="kv"><span>More possible</span><strong>${x.four} YY · ${x.two} SZ</strong></div><div class="kv"><span>Purchased</span><strong>${dateFmt(r.purchaseDate)}</strong></div>${r.price?`<div class="kv"><span>Purchase price</span><strong>¥${escapeHtml(r.price)} RMB</strong></div>`:''}${n(r.price)>0?`<div class="kv"><span>Average string cost / racket</span><strong>¥${(n(r.price)/Math.max(1,plan(original(r)).total)).toFixed(2)} RMB</strong></div><p class="roll-meta">Full-roll price ÷ ${plan(original(r)).total} rackets in the optimal full-roll plan. String cost only.</p>`:''}${r.notes?`<div class="notice" style="margin-top:12px">${escapeHtml(r.notes)}</div>`:''}</section><section class="card detail-card"><h3>Remaining combination</h3><div class="kv"><span>YY</span><strong>${x.four}</strong></div><div class="kv"><span>SZ</span><strong>${x.two}</strong></div><div class="kv"><span>Total rackets</span><strong>${x.total}</strong></div><p>Maximum rackets, with YY prioritized.</p><div class="quick-card" style="margin-top:20px"><h3>Log on this roll</h3>${methodButtons()}</div></section></div><section class="card roll-table" style="margin-top:20px"><div style="padding:18px 20px 0"><h2 style="font-size:16px">Stringing history</h2></div><table><thead><tr><th>DATE</th><th>METHOD</th><th>RACKET</th><th>CONSUMED</th><th></th></tr></thead><tbody>${jobs.length?jobs.map(j=>`<tr><td>${dateFmt(j.date)}</td><td>${escapeHtml(methodName(j.method))}</td><td>${escapeHtml(`${j.racketBrand||''} ${j.racketModel||''}`.trim()||'—')}</td><td>${meters(j.consumption)}</td><td><button class="action-link" data-edit-job="${j.id}">Edit</button></td></tr>`).join(''):`<tr><td colspan="5">${empty('No stringing jobs yet','Log the first completed racket from this roll.')}</td></tr>`}</tbody></table></section>`}
+const saveSettings = () => put('settings', { id: 'preferences', value: state.settings });
 
-function modal(content){document.body.style.overflow='hidden';$('#modalRoot').innerHTML=`<div class="modal-backdrop"><section class="modal" role="dialog" aria-modal="true" aria-label="StringTracker form">${content}</section></div>`;const backdrop=$('.modal-backdrop'),panel=$('.modal');backdrop.addEventListener('click',e=>{if(e.target===e.currentTarget)closeModal()});panel.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;if(b.hasAttribute('data-close')){closeModal();return}if(b.dataset.action==='add-roll'){rollForm();return}if(b.dataset.selectLog){const [key,id]=b.dataset.selectLog.split(':');jobForm(key,id)}});}
-function closeModal(){$('#modalRoot').innerHTML='';document.body.style.overflow=''}
-function toast(message){const el=document.createElement('div');el.className='toast';el.textContent=message;$('#toastRoot').append(el);setTimeout(()=>el.remove(),3400)}
-function rollForm(id){const r=id?rollFor(id):null;modal(`<div class="modal-head"><div><h2>${r?'Edit roll':'Add a string roll'}</h2><p style="margin:5px 0 0;color:var(--muted);font-size:13px">Each physical reel is kept as its own inventory item.</p></div><button class="close" data-close>×</button></div><form id="rollForm"><div class="form-grid"><label class="field">String brand *<input required name="brand" value="${escapeHtml(r?.brand||'')}" placeholder="e.g. Yonex"></label><label class="field">String model *<input required name="model" value="${escapeHtml(r?.model||'')}" placeholder="e.g. BG80"></label><label class="field">Color<input name="color" value="${escapeHtml(r?.color||'')}" placeholder="Optional"></label><label class="field">String remaining now (m) *<input required type="number" min="0" max="200" step="0.0001" name="originalLength" value="${r?remaining(r):200}"></label><label class="field">Purchase date<input type="date" name="purchaseDate" value="${r?.purchaseDate||''}"></label><label class="field">Purchase price (RMB)<input type="number" min="0" step="0.01" name="price" value="${escapeHtml(r?.price||'')}" placeholder="Optional"></label><label class="field full">Notes<textarea name="notes" placeholder="Optional notes">${escapeHtml(r?.notes||'')}</textarea></label></div><div class="modal-footer"><button type="button" class="secondary" data-close>Cancel</button><button class="primary">${r?'Save changes':'Add roll'}</button></div></form>`);$('#rollForm').addEventListener('submit',async e=>{e.preventDefault();const f=new FormData(e.currentTarget);const data=Object.fromEntries(f);if(r){const logged=jobsFor(r.id).reduce((v,j)=>v+n(j.consumption),0);if(n(data.originalLength)+logged>200){toast('Remaining string plus logged usage cannot exceed 200m.');return}Object.assign(r,data,{originalLength:200,openingUsed:200-n(data.originalLength)-logged});await put('rolls',r);toast('Roll updated.')}else{const number=String(Math.max(0,...state.rolls.map(x=>Number(x.rollCode?.match(/\d+/)?.[0])||0))+1).padStart(3,'0');const roll={id:uid('roll'),rollCode:`Roll #${number}`,brand:data.brand.trim(),model:data.model.trim(),color:data.color.trim(),originalLength:200,openingUsed:200-n(data.originalLength),purchaseDate:data.purchaseDate,price:data.price.trim(),notes:data.notes.trim(),archived:false,empty:false,createdAt:new Date().toISOString()};await put('rolls',roll);toast(`${roll.rollCode} added.`)}await load();closeModal();layout();});}
-function chooseRoll(method){const candidates=activeRolls().filter(r=>remaining(r)>=consumption(method));if(!candidates.length){modal(`<div class="modal-head"><h2>No usable roll</h2><button class="close" data-close>×</button></div><div class="notice error">No active roll has enough string for ${methodName(method)} (${meters(consumption(method))}). Add a roll or choose a method with enough remaining string.</div><div class="modal-footer"><button class="primary" data-action="add-roll">Add a roll</button></div>`);return}modal(`<div class="modal-head"><div><h2>Choose a roll</h2><p style="margin:5px 0 0;color:var(--muted);font-size:13px">${methodName(method)} uses ${meters(consumption(method))}.</p></div><button class="close" data-close>×</button></div><div class="roll-list">${candidates.map(r=>`<button class="method-button" data-select-log="${method}:${r.id}"><strong>${escapeHtml(r.brand)} ${escapeHtml(r.model)} · ${escapeHtml(r.rollCode)}</strong><span>${meters(remaining(r))} remaining · ${rollInfo(r).count} logged rackets</span></button>`).join('')}</div>`)}
-function jobForm(method,rollId,jobId){let j=jobId?state.jobs.find(x=>x.id===jobId):null;if(j){method=j.method;rollId=j.rollId}const r=rollFor(rollId), c=j?n(j.consumption):consumption(method);if(!r){toast('That roll no longer exists.');return}const otherUsed=used(r.id)-(j?n(j.consumption):0);const enough=otherUsed+c<=original(r)+1e-9;modal(`<div class="modal-head"><div><h2>${j?'Edit stringing job':'Confirm completed racket'}</h2><p style="margin:5px 0 0;color:var(--muted);font-size:13px">${escapeHtml(r.brand)} ${escapeHtml(r.model)} · ${escapeHtml(r.rollCode)}</p></div><button class="close" data-close>×</button></div>${!enough?`<div id="jobSummary" class="notice error" aria-live="polite">This job would exceed the available string on this roll. Reduce its consumption or choose a different roll.</div>`:`<div id="jobSummary" class="notice" aria-live="polite">${escapeHtml(methodName(method))} will deduct <strong>${meters(c)}</strong>. Remaining after confirmation: <strong>${meters(original(r)-otherUsed-c)}</strong>.</div>`}<form id="jobForm"><input type="hidden" name="method" value="${method}"><input type="hidden" name="rollId" value="${rollId}"><div class="form-grid"><label class="field">Date *<input required type="date" name="date" value="${j?.date||today()}"></label><label class="field">Stringing method<select name="methodChoice"><option value="four" ${method==='four'?'selected':''}>YY (${meters(consumption('four'))})</option><option value="two" ${method==='two'?'selected':''}>SZ (${meters(consumption('two'))})</option></select></label><label class="field">Racket brand<input name="racketBrand" value="${escapeHtml(j?.racketBrand||'')}" placeholder="Optional"></label><label class="field">Racket model<input name="racketModel" value="${escapeHtml(j?.racketModel||'')}" placeholder="Optional"></label><label class="field">Tension<input name="tension" value="${escapeHtml(j?.tension||'')}" placeholder="e.g. 25 × 27 lbs"></label><label class="field">String consumption (m)<input required type="number" min="0.0001" step="0.0001" name="jobConsumption" value="${c}"><small style="font-weight:400">Saved amount is retained in history.</small></label><label class="field full">Notes<textarea name="notes" placeholder="Optional">${escapeHtml(j?.notes||'')}</textarea></label></div><div class="modal-footer"><button type="button" class="secondary" data-close>Cancel</button><button class="primary" ${enough?'':'disabled'}>${j?'Save job':'Confirm & deduct string'}</button></div></form>`);
-  const form=$('#jobForm'), methodChoice=form.elements.methodChoice, amountInput=form.elements.jobConsumption;
-  const updateSummary=()=>{
-    const amount=n(amountInput.value), valid=amount>0&&otherUsed+amount<=original(r)+1e-9;
-    const summary=$('#jobSummary');summary.classList.toggle('error',!valid);
-    summary.innerHTML=valid?`${escapeHtml(methodName(methodChoice.value))} will deduct <strong>${meters(amount)}</strong>. Remaining after confirmation: <strong>${meters(original(r)-otherUsed-amount)}</strong>.`:'Enter a positive amount that fits the remaining string on this roll.';
-    form.querySelector('.primary').disabled=!valid;
-  };
-  methodChoice.addEventListener('change',()=>{amountInput.value=consumption(methodChoice.value);updateSummary();});
-  amountInput.addEventListener('input',updateSummary);
-  $('#jobForm').addEventListener('submit',async e=>{e.preventDefault();const f=Object.fromEntries(new FormData(e.currentTarget));const amount=n(f.jobConsumption), existed=j?used(r.id)-n(j.consumption):used(r.id);if(amount<=0||existed+amount>original(r)+1e-9){toast('This amount exceeds string remaining on the roll.');return}const record={id:j?.id||uid('job'),rollId:r.id,method:f.methodChoice,date:f.date,racketBrand:f.racketBrand.trim(),racketModel:f.racketModel.trim(),tension:f.tension.trim(),notes:f.notes.trim(),consumption:amount,createdAt:j?.createdAt||new Date().toISOString(),updatedAt:new Date().toISOString()};await put('jobs',record);await load();closeModal();layout();toast(j?'Job updated; inventory recalculated.':'Racket logged and string deducted.');});}
-function confirmDeleteJob(id){const j=state.jobs.find(x=>x.id===id);if(!j)return;modal(`<div class="modal-head"><h2>Delete this job?</h2><button class="close" data-close>×</button></div><p style="color:var(--muted);line-height:1.5">This removes the ${meters(j.consumption)} ${escapeHtml(methodName(j.method))} record. The roll’s remaining string will be recalculated automatically.</p><div class="modal-footer"><button class="secondary" data-close>Cancel</button><button class="danger" id="confirmDelete">Delete job</button></div>`);$('#confirmDelete').onclick=async()=>{await remove('jobs',id);await load();closeModal();layout();toast('Job deleted; inventory recalculated.')}}
-function exportData(){const payload={app:'StringTracker',version:1,exportedAt:new Date().toISOString(),rolls:state.rolls,jobs:state.jobs,settings:state.settings};const url=URL.createObjectURL(new Blob([JSON.stringify(payload,null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download=`stringtracker-backup-${today()}.json`;a.click();URL.revokeObjectURL(url);state.settings.lastBackupAt=today();saveSettings();toast('Backup downloaded. Keep it somewhere safe.');}
-async function importData(file){try{const payload=JSON.parse(await file.text());if(!payload||payload.app!=='StringTracker'||!Array.isArray(payload.rolls)||!Array.isArray(payload.jobs)||typeof payload.settings!=='object')throw Error('Invalid backup structure');if(!payload.rolls.every(r=>r.id&&r.brand&&r.model&&Number.isFinite(Number(r.originalLength)))||!payload.jobs.every(j=>j.id&&j.rollId&&j.method&&Number.isFinite(Number(j.consumption))))throw Error('Backup contains invalid records');modal(`<div class="modal-head"><h2>Replace local data?</h2><button class="close" data-close>×</button></div><div class="notice warn">This backup contains ${payload.rolls.length} roll(s) and ${payload.jobs.length} job(s). Importing it replaces all current StringTracker data on this device.</div><div class="modal-footer"><button class="secondary" data-close>Cancel</button><button class="danger" id="confirmImport">Replace & import</button></div>`);$('#confirmImport').onclick=async()=>{for(const s of ['rolls','jobs','settings'])await clearStore(s);for(const r of payload.rolls)await put('rolls',r);for(const j of payload.jobs)await put('jobs',j);await put('settings',{id:'preferences',value:{...DEFAULT_SETTINGS,...payload.settings}});await load();closeModal();layout();toast('Backup restored successfully.');}}catch(err){toast(`Could not import this file: ${err.message}`)}}
-function resetData(){modal(`<div class="modal-head"><h2>Reset all local data?</h2><button class="close" data-close>×</button></div><div class="notice error">This permanently removes all rolls, jobs, and local settings from this device. Export a backup first if you might need these records later.</div><div class="modal-footer"><button class="secondary" data-close>Cancel</button><button class="danger" id="confirmReset">Reset all data</button></div>`);$('#confirmReset').onclick=async()=>{for(const s of ['rolls','jobs','settings'])await clearStore(s);await load();closeModal();state.page='dashboard';layout();toast('All local StringTracker data has been reset.')}}
-
-function bindPage(){
-  $$('[data-instant]').forEach(el=>el.onclick=async()=>{el.disabled=true;const r=rollFor(el.dataset.id),method=el.dataset.instant,c=consumption(method);if(remaining(r)+1e-9<c){toast('Not enough string.');return}try{await put('jobs',{id:uid('job'),rollId:r.id,method,date:today(),consumption:c,racketBrand:'',racketModel:'',tension:'',notes:'',createdAt:new Date().toISOString()});await load();layout();toast('Racket logged. Edit or remove it in History.')}catch(e){el.disabled=false;toast('Could not save. Please try again.')}});
-
-  $$('[data-page]').forEach(el=>el.onclick=()=>{state.page=el.dataset.page;state.selectedRoll=null;layout();closeMenu();window.scrollTo({top:0,behavior:'instant'})});
-  $$('[data-action="add-roll"]').forEach(el=>el.onclick=()=>rollForm());
-  $$('[data-action="quick-log"]').forEach(el=>el.onclick=()=>chooseRoll(state.settings.defaultMethod));
-  $$('[data-log]').forEach(el=>el.onclick=()=>{const key=el.dataset.log;if(state.page==='rollDetail'&&state.selectedRoll){const r=rollFor(state.selectedRoll);if(r&&remaining(r)>=consumption(key))jobForm(key,r.id);else toast('This roll does not have enough remaining string.')}else chooseRoll(key)});
-  $$('[data-roll]').forEach(el=>el.onclick=()=>{state.selectedRoll=el.dataset.roll;state.page='rollDetail';layout();window.scrollTo({top:0,behavior:'instant'})});
-  $$('.roll-card[data-roll]').forEach(el=>el.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();el.click();}});
-  $$('[data-edit-roll]').forEach(el=>el.onclick=()=>rollForm(el.dataset.editRoll));
-  $$('[data-toggle-archive]').forEach(el=>el.onclick=async()=>{const r=rollFor(el.dataset.toggleArchive);r.archived=!r.archived;await put('rolls',r);await load();layout();toast(r.archived?'Roll archived; its history is retained.':'Roll restored.');});
-  $$('[data-edit-job]').forEach(el=>el.onclick=()=>jobForm(null,null,el.dataset.editJob));
-  $$('[data-delete-job]').forEach(el=>el.onclick=()=>confirmDeleteJob(el.dataset.deleteJob));
-  $$('[data-close]').forEach(el=>el.onclick=closeModal);
-  $$('[data-select-log]').forEach(el=>el.onclick=()=>{const [key,id]=el.dataset.selectLog.split(':');jobForm(key,id)});
-  $('[data-action="export"]')?.addEventListener('click',exportData);
-  $('[data-action="import"]')?.addEventListener('click',()=>$('#importFile').click());
-  $('#importFile')?.addEventListener('change',e=>{if(e.target.files[0])importData(e.target.files[0]);e.target.value=''});
-  $('[data-action="reset"]')?.addEventListener('click',resetData);
-  $('#rollSearch')?.addEventListener('input',filterRolls);$('#rollStatus')?.addEventListener('change',filterRolls);
-  ['jobSearch','jobRoll','jobMethod','jobDate'].forEach(id=>$('#'+id)?.addEventListener(id==='jobSearch'?'input':'change',filterJobs));
-  $('#settingsForm')?.addEventListener('submit',async e=>{e.preventDefault();const f=Object.fromEntries(new FormData(e.currentTarget));Object.assign(state.settings,{defaultLength:n(f.defaultLength),racketLength:n(f.racketLength),endLength:n(f.endLength),defaultMethod:f.defaultMethod});await saveSettings();await load();layout();toast('Calculation settings saved for future jobs.');});
-  $('#appearanceForm')?.addEventListener('submit',async e=>{e.preventDefault();const f=Object.fromEntries(new FormData(e.currentTarget));Object.assign(state.settings,{lowWarning:n(f.lowWarning),criticalWarning:n(f.criticalWarning),theme:f.theme});await saveSettings();setTheme(f.theme);layout();toast('Preferences saved.');});
+/* ---------- calculations ---------- */
+function consumption(key) {
+  const m = METHODS[key];
+  return (m.racketUnits * state.settings.racketLength + m.endUnits * state.settings.endLength) / 100;
 }
-function filterRolls(){const q=$('#rollSearch').value.toLowerCase(),status=$('#rollStatus').value;const list=state.rolls.filter(r=>{const hay=`${r.brand} ${r.model} ${r.rollCode} ${r.color||''}`.toLowerCase();return hay.includes(q)&&(status==='all'||(status==='active'?!r.archived:r.archived))});$('#rollRows').innerHTML=rollRows(list);labelTableCells();$$('#rollRows [data-roll]').forEach(el=>el.onclick=()=>{state.selectedRoll=el.dataset.roll;state.page='rollDetail';layout();window.scrollTo({top:0,behavior:'instant'})});}
-function filterJobs(){const q=$('#jobSearch').value.toLowerCase(),roll=$('#jobRoll').value,method=$('#jobMethod').value,date=$('#jobDate').value;const list=state.jobs.filter(j=>{const r=rollFor(j.rollId);const hay=`${r?.brand||''} ${r?.model||''} ${r?.rollCode||''} ${j.racketBrand||''} ${j.racketModel||''} ${j.notes||''}`.toLowerCase();return hay.includes(q)&&(!roll||j.rollId===roll)&&(!method||j.method===method)&&(!date||j.date===date)});$('#jobRows').innerHTML=jobRows(list);labelTableCells();$$('#jobRows [data-edit-job]').forEach(el=>el.onclick=()=>jobForm(null,null,el.dataset.editJob));$$('#jobRows [data-delete-job]').forEach(el=>el.onclick=()=>confirmDeleteJob(el.dataset.deleteJob));}
-function setTheme(theme){document.body.classList.toggle('dark',theme==='dark');$('#themeToggle').innerHTML=theme==='dark'?'☀ <span>Light mode</span>':'☾ <span>Dark mode</span>';}
-function closeMenu(){$('.sidebar').classList.remove('open')}
-async function init(){try{db=await openDB();await load();layout();if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js').catch(()=>{});window.addEventListener('online',syncOffline);window.addEventListener('offline',syncOffline);syncOffline();window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();deferredInstall=e;$('#installButton').classList.remove('hidden')});$('#installButton').onclick=async()=>{if(deferredInstall){deferredInstall.prompt();await deferredInstall.userChoice;deferredInstall=null;$('#installButton').classList.add('hidden')}};$('#themeToggle').onclick=async()=>{state.settings.theme=state.settings.theme==='dark'?'light':'dark';await saveSettings();setTheme(state.settings.theme);layout()};$('#menuButton').onclick=()=>$('.sidebar').classList.toggle('open');}catch(err){$('#app').innerHTML=`<div class="card empty"><strong>Storage could not start</strong>StringTracker needs browser IndexedDB enabled. ${escapeHtml(err.message)}</div>`;}}
-document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal()});
-function syncOffline(){$('#offlineStatus').classList.toggle('hidden',navigator.onLine)}
-init();
+const minConsumption = () => Math.min(consumption('four'), consumption('two'));
+const rollFor = id => state.rolls.find(r => r.id === id);
+const jobsFor = id => state.jobs.filter(j => j.rollId === id);
+const logged = id => jobsFor(id).reduce((sum, j) => sum + n(j.consumption), 0);
+// Rolls saved by the first version stored "remaining" as originalLength with no openingUsed.
+const isLegacy = r => r.openingUsed == null && n(r.originalLength) > 0 && n(r.originalLength) < 200;
+const original = r => isLegacy(r) ? 200 : (n(r.originalLength) || 200);
+const openingUsed = r => isLegacy(r) ? 200 - n(r.originalLength) : n(r.openingUsed);
+const used = r => openingUsed(r) + logged(r.id);
+const remaining = r => Math.max(0, original(r) - used(r));
+const isFinished = r => remaining(r) + 1e-9 < minConsumption();
+const isLow = r => !isFinished(r) && remaining(r) < state.settings.lowWarning;
+// Most rackets that fit in `length`, using as many YY as possible without reducing the total.
+function plan(length) {
+  const a = consumption('four'), b = consumption('two');
+  if (!(a > 0 && b > 0)) return { four: 0, two: 0, total: 0 };
+  const total = Math.floor((length + 1e-9) / Math.min(a, b));
+  const four = a > b ? Math.max(0, Math.min(total, Math.floor((length - total * b + 1e-9) / (a - b)))) : total;
+  return { four, two: total - four, total };
+}
+const activeRolls = () => state.rolls.filter(r => !r.archived)
+  .sort((a, b) => Number(isFinished(a)) - Number(isFinished(b)) || String(b.createdAt).localeCompare(String(a.createdAt)));
+const rollName = r => `${r.brand} ${r.model}`;
+function rollSub(r) {
+  const twin = state.rolls.some(o => o.id !== r.id && rollName(o).toLowerCase() === rollName(r).toLowerCase());
+  return [r.color, twin ? r.rollCode : ''].filter(Boolean).join(' · ');
+}
+const sortedJobs = list => [...list].sort((a, b) => String(b.date).localeCompare(String(a.date)) || String(b.createdAt).localeCompare(String(a.createdAt)));
+
+/* ---------- views ---------- */
+function emptyState(title, body, button = '') {
+  return `<div class="empty"><strong>${title}</strong><p>${body}</p>${button}</div>`;
+}
+const addRollButton = `<button class="btn primary" data-act="add-roll">${ICON.plus}Add roll</button>`;
+
+function bar(r) {
+  const pct = Math.min(100, remaining(r) / original(r) * 100);
+  return `<div class="bar ${isFinished(r) ? 'done' : isLow(r) ? 'low' : ''}"><span style="width:${pct}%"></span></div>`;
+}
+function statusPill(r) {
+  if (isFinished(r)) return '<span class="pill muted">Finished</span>';
+  if (isLow(r)) return '<span class="pill warn">Low</span>';
+  return '';
+}
+function logButtons(r) {
+  if (r.archived) return '';
+  if (isFinished(r)) return `<div class="finished-note"><span>Not enough left for another racket.</span><button class="btn small" data-act="archive" data-id="${r.id}">Archive</button></div>`;
+  const p = plan(remaining(r)), rem = remaining(r);
+  const button = key => `<button class="log" data-act="log" data-method="${key}" data-id="${r.id}" ${p[key] < 1 || rem + 1e-9 < consumption(key) ? 'disabled' : ''} aria-label="Log a ${METHODS[key].name} racket on ${esc(rollName(r))}">${ICON.plus}<b>${METHODS[key].name}</b><small>${p[key]} left</small></button>`;
+  return `<div class="log-row">${button('four')}${button('two')}</div>`;
+}
+function rollCard(r) {
+  const sub = rollSub(r);
+  return `<article class="card roll">
+    <a class="roll-top" href="#/roll/${r.id}">
+      <span class="roll-name"><strong>${esc(rollName(r))}</strong>${statusPill(r)}${sub ? `<small>${esc(sub)}</small>` : ''}</span>
+      <span class="roll-left"><strong>${num(remaining(r))}</strong> m left</span>
+    </a>
+    ${bar(r)}
+    ${logButtons(r)}
+  </article>`;
+}
+function home() {
+  if (!state.rolls.length) return emptyState('No rolls yet', 'Add a string roll, then tap YY or SZ each time you string a racket.', addRollButton);
+  const active = activeRolls(), archived = state.rolls.filter(r => r.archived);
+  return `<div class="page-head"><h1>Rolls</h1>${addRollButton}</div>
+    ${active.length ? `<div class="roll-grid">${active.map(rollCard).join('')}</div>` : '<p class="hint">All your rolls are archived.</p>'}
+    ${archived.length ? `<details class="archived"><summary>Archived (${archived.length})</summary><div class="card list">${archived.map(r => `<a class="row" href="#/roll/${r.id}"><span class="row-main"><strong>${esc(rollName(r))}</strong><small>${meters(remaining(r))} left</small></span>${ICON.chevron}</a>`).join('')}</div></details>` : ''}`;
+}
+
+function jobRow(j, showRoll) {
+  const r = rollFor(j.rollId);
+  const racket = `${j.racketBrand || ''} ${j.racketModel || ''}`.trim();
+  const title = showRoll ? (r ? rollName(r) : 'Deleted roll') : dateFmt(j.date);
+  const sub = [showRoll ? dateFmt(j.date) : '', j.tension, racket].filter(Boolean).join(' · ');
+  return `<button class="row" data-act="edit-job" data-id="${j.id}"><span class="row-main"><strong>${esc(title)}</strong>${sub ? `<small>${esc(sub)}</small>` : ''}</span><span class="pill">${esc(METHODS[j.method]?.name || j.method)}</span></button>`;
+}
+function filteredJobs() {
+  const q = state.jobQuery.trim().toLowerCase();
+  return sortedJobs(state.jobs.filter(j => {
+    if (state.jobMethod && j.method !== state.jobMethod) return false;
+    if (!q) return true;
+    const r = rollFor(j.rollId);
+    return `${r ? rollName(r) : ''} ${j.racketBrand || ''} ${j.racketModel || ''} ${j.tension || ''} ${j.notes || ''}`.toLowerCase().includes(q);
+  }));
+}
+const jobList = () => { const list = filteredJobs(); return list.length ? list.map(j => jobRow(j, true)).join('') : '<p class="hint pad">Nothing matches.</p>'; };
+function seg(act, current, options) {
+  return `<div class="seg">${options.map(([value, label]) => `<button data-act="${act}" data-value="${value}" aria-pressed="${value === current}">${label}</button>`).join('')}</div>`;
+}
+function history() {
+  if (!state.jobs.length) return `<div class="page-head"><h1>History</h1></div>${emptyState('Nothing logged yet', 'Rackets you log from a roll will show up here.')}`;
+  return `<div class="page-head"><h1>History</h1></div>
+    <div class="filters"><input type="search" id="jobSearch" placeholder="Search" aria-label="Search history" value="${esc(state.jobQuery)}">${seg('filter-method', state.jobMethod, [['', 'All'], ['four', 'YY'], ['two', 'SZ']])}</div>
+    <div class="card list" id="jobRows">${jobList()}</div>
+    <p class="hint">Tap an entry to edit or delete it.</p>`;
+}
+
+function most(list) {
+  const counts = {};
+  list.forEach(x => counts[x] = (counts[x] || 0) + 1);
+  return Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0];
+}
+const kv = (label, value) => `<div class="kv"><span>${label}</span><strong>${value}</strong></div>`;
+function stats() {
+  if (!state.jobs.length) return `<div class="page-head"><h1>Stats</h1></div>${emptyState('No stats yet', 'Log a few rackets and your numbers will appear here.')}`;
+  const count = state.jobs.length, consumed = state.jobs.reduce((x, j) => x + n(j.consumption), 0);
+  const of = key => state.jobs.filter(j => j.method === key).length;
+  const popular = most(state.jobs.map(j => rollFor(j.rollId)).filter(Boolean).map(rollName));
+  return `<div class="page-head"><h1>Stats</h1></div>
+    <div class="tiles">
+      <div class="card tile"><strong>${count}</strong><span>rackets</span></div>
+      <div class="card tile"><strong>${num(consumed)}<i> m</i></strong><span>string used</span></div>
+      <div class="card tile"><strong>${num(consumed / count)}<i> m</i></strong><span>per racket</span></div>
+    </div>
+    <div class="card facts">
+      ${kv('YY rackets', of('four'))}${kv('SZ rackets', of('two'))}
+      ${popular ? kv('Most used string', esc(popular)) : ''}
+      ${kv('Rolls finished', state.rolls.filter(isFinished).length)}
+    </div>`;
+}
+
+const perRacketText = () => `YY uses <strong>${meters(consumption('four'))}</strong> and SZ uses <strong>${meters(consumption('two'))}</strong> per racket.`;
+function settings() {
+  const s = state.settings;
+  const field = (key, label, step, min) => `<label class="field">${label}<input type="number" inputmode="decimal" min="${min}" step="${step}" data-setting="${key}" value="${s[key]}"></label>`;
+  return `<div class="page-head"><h1>Settings</h1></div>
+    <section class="card section"><h2>Measurements</h2>
+      <div class="form-grid">${field('racketLength', 'Racket length (cm)', '0.01', '1')}${field('endLength', 'End to T-head (cm)', '0.01', '0')}${field('defaultLength', 'New roll length (m)', '1', '1')}${field('lowWarning', 'Low warning below (m)', '1', '0')}</div>
+      <p class="hint" id="perRacket">${perRacketText()}</p>
+    </section>
+    <section class="card section"><h2>Appearance</h2>${seg('theme', s.theme === 'light' || s.theme === 'dark' ? s.theme : 'auto', [['auto', 'Auto'], ['light', 'Light'], ['dark', 'Dark']])}</section>
+    <section class="card section"><h2>Backup</h2>
+      <p class="hint">Data stays on this device only. Export a backup to keep it safe or move it to another device.</p>
+      <div class="btn-row"><button class="btn" data-act="export">Export</button><button class="btn" data-act="import">Import</button><input id="importFile" type="file" accept="application/json,.json" hidden></div>
+      ${s.lastBackupAt ? `<p class="hint">Last export: ${dateFmt(s.lastBackupAt)}</p>` : ''}
+    </section>
+    <section class="card section"><h2>App</h2>
+      ${deferredInstall ? '<div class="btn-row"><button class="btn" data-act="install">Install app</button></div>' : '<p class="hint">To install: use your browser’s “Install app”, or on iPhone tap Share → Add to Home Screen.</p>'}
+      <div class="btn-row"><button class="btn danger" data-act="reset">Reset all data</button></div>
+    </section>`;
+}
+
+function rollDetail() {
+  const r = rollFor(state.rollId);
+  const jobs = sortedJobs(jobsFor(r.id)), sub = [r.color, r.rollCode].filter(Boolean).join(' · ');
+  const of = key => jobs.filter(j => j.method === key).length;
+  const fullPlan = plan(original(r)).total;
+  return `<a class="back" href="#/">${ICON.back}Rolls</a>
+    <div class="page-head"><div><h1>${esc(rollName(r))}</h1>${sub ? `<p class="sub">${esc(sub)}</p>` : ''}</div>
+      <div class="btn-row"><button class="btn small" data-act="edit-roll" data-id="${r.id}">Edit</button><button class="btn small" data-act="archive" data-id="${r.id}">${r.archived ? 'Restore' : 'Archive'}</button></div></div>
+    <section class="card hero">
+      <div class="big">${num(remaining(r))}<i> m</i>${statusPill(r)}</div>
+      <p class="sub">left of ${meters(original(r))}</p>
+      ${bar(r)}
+      ${logButtons(r)}
+    </section>
+    <section class="card facts">
+      ${kv('Rackets strung', jobs.length ? `${jobs.length} <small>(${of('four')} YY · ${of('two')} SZ)</small>` : '0')}
+      ${n(r.price) > 0 && fullPlan ? kv('String cost per racket', `¥${(n(r.price) / fullPlan).toFixed(2)}`) : ''}
+      ${r.purchaseDate ? kv('Bought', dateFmt(r.purchaseDate)) : ''}
+      ${r.notes ? `<p class="notes">${esc(r.notes)}</p>` : ''}
+    </section>
+    ${jobs.length ? `<h2 class="list-title">History</h2><div class="card list">${jobs.map(j => jobRow(j, false)).join('')}</div>` : ''}`;
+}
+
+const VIEWS = { home, history, stats, settings, roll: rollDetail };
+function render() {
+  if (state.page === 'roll' && !rollFor(state.rollId)) { location.replace('#/'); return; }
+  $('#app').innerHTML = VIEWS[state.page]();
+  const current = state.page === 'roll' ? 'home' : state.page;
+  $$('[data-nav]').forEach(a => a.dataset.nav === current ? a.setAttribute('aria-current', 'page') : a.removeAttribute('aria-current'));
+}
+function route() {
+  const [, page, id] = location.hash.split('/');
+  state.page = ['history', 'stats', 'settings', 'roll'].includes(page) ? page : 'home';
+  state.rollId = state.page === 'roll' ? id : null;
+  closeModal();
+  render();
+  window.scrollTo(0, 0);
+}
+
+/* ---------- modal & toast ---------- */
+function modal(title, content) {
+  document.body.style.overflow = 'hidden';
+  $('#modalRoot').innerHTML = `<div class="backdrop"><section class="modal" role="dialog" aria-modal="true" aria-label="${esc(title)}"><div class="modal-head"><h2>${esc(title)}</h2><button class="close" data-act="close" aria-label="Close">×</button></div>${content}</section></div>`;
+  $('.backdrop').addEventListener('click', e => { if (e.target === e.currentTarget) closeModal(); });
+}
+function closeModal() { $('#modalRoot').innerHTML = ''; document.body.style.overflow = ''; }
+function confirmModal(title, body, label, onConfirm) {
+  modal(title, `<p class="modal-text">${body}</p><div class="modal-foot"><button class="btn" data-act="close">Cancel</button><button class="btn danger solid" id="confirmYes">${label}</button></div>`);
+  $('#confirmYes').onclick = onConfirm;
+}
+let toastTimer;
+function toast(message, actionLabel, action) {
+  clearTimeout(toastTimer);
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.append(Object.assign(document.createElement('span'), { textContent: message }));
+  if (action) {
+    const b = Object.assign(document.createElement('button'), { textContent: actionLabel });
+    b.onclick = () => { el.remove(); action(); };
+    el.append(b);
+  }
+  $('#toastRoot').replaceChildren(el);
+  toastTimer = setTimeout(() => el.remove(), action ? 6000 : 2600);
+}
+
+/* ---------- actions ---------- */
+async function refresh() { await load(); render(); }
+
+async function logRacket(rollId, method) {
+  if (busy) return;
+  const r = rollFor(rollId), c = consumption(method);
+  if (!r || remaining(r) + 1e-9 < c) { toast('Not enough string on this roll.'); return; }
+  busy = true;
+  try {
+    const job = { id: uid('job'), rollId, method, date: today(), consumption: c, racketBrand: '', racketModel: '', tension: '', notes: '', createdAt: new Date().toISOString() };
+    await put('jobs', job);
+    await refresh();
+    toast(`${METHODS[method].name} racket logged`, 'Undo', async () => { await remove('jobs', job.id); await refresh(); toast('Removed.'); });
+  } catch (e) { toast('Could not save. Please try again.'); }
+  busy = false;
+}
+
+function rollForm(id) {
+  const r = id ? rollFor(id) : null;
+  const full = r ? original(r) : (n(state.settings.defaultLength) || 200);
+  const extras = r && (r.color || r.purchaseDate || r.price || r.notes);
+  modal(r ? 'Edit roll' : 'Add roll', `<form id="rollForm">
+    <div class="form-grid">
+      <label class="field">Brand<input required name="brand" value="${esc(r?.brand || '')}" placeholder="Yonex"></label>
+      <label class="field">Model<input required name="model" value="${esc(r?.model || '')}" placeholder="BG80"></label>
+      <label class="field full">String left now (m)<input required type="number" inputmode="decimal" min="0" max="2000" step="0.0001" name="left" value="${r ? round4(remaining(r)) : full}"></label>
+    </div>
+    <details class="more" ${extras ? 'open' : ''}><summary>More details</summary><div class="form-grid">
+      <label class="field">Color<input name="color" value="${esc(r?.color || '')}"></label>
+      <label class="field">Price (¥)<input type="number" inputmode="decimal" min="0" step="0.01" name="price" value="${esc(r?.price || '')}"></label>
+      <label class="field full">Bought on<input type="date" name="purchaseDate" value="${esc(r?.purchaseDate || '')}"></label>
+      <label class="field full">Notes<textarea name="notes" rows="2">${esc(r?.notes || '')}</textarea></label>
+    </div></details>
+    <div class="modal-foot">${r ? '<button type="button" class="btn danger left" id="deleteRoll">Delete</button>' : ''}<button type="button" class="btn" data-act="close">Cancel</button><button class="btn primary">${r ? 'Save' : 'Add roll'}</button></div>
+  </form>`);
+  if (r) $('#deleteRoll').onclick = () => deleteRoll(r);
+  else $('#rollForm').elements.brand.focus();
+  $('#rollForm').addEventListener('submit', async e => {
+    e.preventDefault();
+    const f = Object.fromEntries(new FormData(e.currentTarget));
+    const left = n(f.left), done = r ? logged(r.id) : 0;
+    // A roll holding more than the standard length is simply a longer roll.
+    const length = Math.max(full, round4(left + done));
+    const fields = { brand: f.brand.trim(), model: f.model.trim(), color: f.color.trim(), price: f.price.trim(), purchaseDate: f.purchaseDate, notes: f.notes.trim(), originalLength: length, openingUsed: Math.max(0, round4(length - left - done)) };
+    if (r) await put('rolls', { ...r, ...fields });
+    else {
+      const number = String(Math.max(0, ...state.rolls.map(x => Number(x.rollCode?.match(/\d+/)?.[0]) || 0)) + 1).padStart(3, '0');
+      await put('rolls', { id: uid('roll'), rollCode: `Roll #${number}`, ...fields, archived: false, empty: false, createdAt: new Date().toISOString() });
+      // Ask the browser not to evict this data when the device runs low on space.
+      navigator.storage?.persist?.().catch(() => {});
+    }
+    closeModal();
+    await refresh();
+    toast(r ? 'Roll updated.' : 'Roll added.');
+  });
+}
+
+function deleteRoll(r) {
+  const count = jobsFor(r.id).length;
+  confirmModal('Delete this roll?', `${esc(rollName(r))} ${count ? `and its ${count} logged racket${count === 1 ? '' : 's'} ` : ''}will be permanently deleted. To keep the history, archive the roll instead.`, 'Delete', async () => {
+    for (const j of jobsFor(r.id)) await remove('jobs', j.id);
+    await remove('rolls', r.id);
+    closeModal();
+    await load();
+    if (location.hash === '#/' || !location.hash) render(); else location.hash = '#/';
+    toast('Roll deleted.');
+  });
+}
+
+async function deleteJob(j) {
+  await remove('jobs', j.id);
+  closeModal();
+  await refresh();
+  toast('Entry deleted', 'Undo', async () => { await put('jobs', j); await refresh(); });
+}
+function jobForm(jobId) {
+  const j = state.jobs.find(x => x.id === jobId);
+  if (!j) return;
+  const r = rollFor(j.rollId);
+  if (!r) { confirmModal('Delete this entry?', 'Its roll no longer exists.', 'Delete', () => deleteJob(j)); return; }
+  const option = key => `<option value="${key}" ${j.method === key ? 'selected' : ''}>${METHODS[key].name}</option>`;
+  const extras = j.racketBrand || j.racketModel || j.notes;
+  modal('Edit entry', `<p class="modal-text">${esc(rollName(r))}</p><form id="jobForm">
+    <div class="form-grid">
+      <label class="field">Date<input required type="date" name="date" value="${esc(j.date || today())}"></label>
+      <label class="field">Method<select name="method">${option('four')}${option('two')}</select></label>
+      <label class="field full">Tension<input name="tension" value="${esc(j.tension || '')}" placeholder="e.g. 26 lbs"></label>
+    </div>
+    <details class="more" ${extras ? 'open' : ''}><summary>More details</summary><div class="form-grid">
+      <label class="field">Racket brand<input name="racketBrand" value="${esc(j.racketBrand || '')}"></label>
+      <label class="field">Racket model<input name="racketModel" value="${esc(j.racketModel || '')}"></label>
+      <label class="field full">String used (m)<input required type="number" inputmode="decimal" min="0.0001" step="0.0001" name="amount" value="${n(j.consumption)}"></label>
+      <label class="field full">Notes<textarea name="notes" rows="2">${esc(j.notes || '')}</textarea></label>
+    </div></details>
+    <div class="modal-foot"><button type="button" class="btn danger left" id="deleteJob">Delete</button><button type="button" class="btn" data-act="close">Cancel</button><button class="btn primary">Save</button></div>
+  </form>`);
+  const form = $('#jobForm');
+  form.elements.method.addEventListener('change', () => { form.elements.amount.value = consumption(form.elements.method.value); });
+  $('#deleteJob').onclick = () => deleteJob(j);
+  form.addEventListener('submit', async e => {
+    e.preventDefault();
+    const f = Object.fromEntries(new FormData(form));
+    const amount = n(f.amount), others = used(r) - n(j.consumption);
+    if (amount <= 0 || others + amount > original(r) + 1e-9) { toast('That is more string than this roll has left.'); return; }
+    await put('jobs', { ...j, method: f.method, date: f.date, tension: f.tension.trim(), racketBrand: f.racketBrand.trim(), racketModel: f.racketModel.trim(), notes: f.notes.trim(), consumption: amount, updatedAt: new Date().toISOString() });
+    closeModal();
+    await refresh();
+    toast('Saved.');
+  });
+}
+
+async function toggleArchive(id) {
+  const r = rollFor(id);
+  if (!r) return;
+  await put('rolls', { ...r, archived: !r.archived });
+  await load();
+  toast(r.archived ? 'Roll restored.' : 'Roll archived. Its history is kept.');
+  if (state.page === 'roll' && !r.archived) location.hash = '#/'; else render();
+}
+
+async function exportData() {
+  const payload = { app: 'StringTracker', version: 1, exportedAt: new Date().toISOString(), rolls: state.rolls, jobs: state.jobs, settings: state.settings };
+  const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }));
+  Object.assign(document.createElement('a'), { href: url, download: `stringtracker-backup-${today()}.json` }).click();
+  URL.revokeObjectURL(url);
+  state.settings.lastBackupAt = today();
+  await saveSettings();
+  render();
+  toast('Backup downloaded.');
+}
+async function replaceAll(rolls, jobs, settingsValue) {
+  for (const s of ['rolls', 'jobs', 'settings']) await clearStore(s);
+  for (const r of rolls) await put('rolls', r);
+  for (const j of jobs) await put('jobs', j);
+  if (settingsValue) await put('settings', { id: 'preferences', value: { ...DEFAULT_SETTINGS, ...settingsValue } });
+  closeModal();
+  await refresh();
+}
+async function importData(file) {
+  try {
+    const p = JSON.parse(await file.text());
+    if (!p || p.app !== 'StringTracker' || !Array.isArray(p.rolls) || !Array.isArray(p.jobs) || !p.settings || typeof p.settings !== 'object') throw Error('not a StringTracker backup');
+    if (!p.rolls.every(r => r.id && r.brand && r.model && Number.isFinite(Number(r.originalLength))) || !p.jobs.every(j => j.id && j.rollId && j.method && Number.isFinite(Number(j.consumption)))) throw Error('backup contains invalid records');
+    confirmModal('Replace your data?', `This backup has ${p.rolls.length} roll(s) and ${p.jobs.length} racket(s). Importing replaces everything currently on this device.`, 'Replace', async () => { await replaceAll(p.rolls, p.jobs, p.settings); toast('Backup restored.'); });
+  } catch (err) { toast(`Could not import: ${err.message}`); }
+}
+function resetData() {
+  confirmModal('Reset all data?', 'This permanently deletes every roll, entry and setting on this device. Export a backup first if you might want them back.', 'Reset', async () => { await replaceAll([], [], null); toast('All data reset.'); });
+}
+
+const systemDark = window.matchMedia('(prefers-color-scheme: dark)');
+function applyTheme() {
+  const t = state.settings.theme, explicit = t === 'light' || t === 'dark';
+  if (explicit) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
+  try { explicit ? localStorage.setItem('st-theme', t) : localStorage.removeItem('st-theme'); } catch (e) { /* storage blocked */ }
+  const dark = explicit ? t === 'dark' : systemDark.matches;
+  $('meta[name="theme-color"]').content = dark ? '#111315' : '#f4f3ef';
+}
+
+/* ---------- events ---------- */
+const ACTIONS = {
+  'add-roll': () => rollForm(),
+  'edit-roll': el => rollForm(el.dataset.id),
+  'archive': el => toggleArchive(el.dataset.id),
+  'log': el => logRacket(el.dataset.id, el.dataset.method),
+  'edit-job': el => jobForm(el.dataset.id),
+  'close': closeModal,
+  'filter-method': el => { state.jobMethod = el.dataset.value; render(); },
+  'theme': async el => { state.settings.theme = el.dataset.value; await saveSettings(); applyTheme(); render(); },
+  'export': exportData,
+  'import': () => $('#importFile').click(),
+  'reset': resetData,
+  'install': async () => { if (!deferredInstall) return; deferredInstall.prompt(); await deferredInstall.userChoice; deferredInstall = null; render(); },
+};
+document.addEventListener('click', e => {
+  const el = e.target.closest('[data-act]');
+  if (el && !el.disabled) ACTIONS[el.dataset.act]?.(el);
+});
+document.addEventListener('input', e => {
+  if (e.target.id === 'jobSearch') { state.jobQuery = e.target.value; $('#jobRows').innerHTML = jobList(); }
+});
+document.addEventListener('change', async e => {
+  const el = e.target;
+  if (el.id === 'importFile') { if (el.files[0]) importData(el.files[0]); el.value = ''; return; }
+  const key = el.dataset?.setting;
+  if (!key) return;
+  const value = n(el.value);
+  if (el.value.trim() === '' || value < n(el.min)) { el.value = state.settings[key]; toast('Enter a valid number.'); return; }
+  state.settings[key] = value;
+  await saveSettings();
+  $('#perRacket').innerHTML = perRacketText();
+  toast('Saved.');
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+window.addEventListener('hashchange', route);
+systemDark.addEventListener('change', applyTheme);
+const syncOffline = () => { $('#offlineStatus').hidden = navigator.onLine; };
+window.addEventListener('online', syncOffline);
+window.addEventListener('offline', syncOffline);
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); deferredInstall = e; if (state.page === 'settings') render(); });
+
+(async function init() {
+  try {
+    db = await openDB();
+    await load();
+    route();
+    syncOffline();
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
+  } catch (err) {
+    $('#app').innerHTML = emptyState('Storage could not start', `StringTracker needs browser storage (IndexedDB) enabled. ${esc(err.message)}`);
+  }
+})();
