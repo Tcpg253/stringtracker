@@ -217,3 +217,5 @@ body.dark .low-banner { background: #4a3b1c; color: #ffe5a7; }
   #mobileNav button.active { background: var(--ink); color: var(--surface); }
 }
 @media (prefers-reduced-motion:reduce) { * { transition: none !important; scroll-behavior: auto !important; } }
+
+.roll-quick-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:18px}.roll-quick-actions .action-link{grid-column:1/-1}.roll-section>.roll-list{max-width:850px}.roll-card{cursor:default}
