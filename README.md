@@ -14,14 +14,16 @@ Then open `http://localhost:8080` in a modern browser. The app will be usable of
 
 ## Data and backups
 
-Data remains on the device/browser where it was created. It does **not** automatically synchronize between phones and computers. Open **Settings → Export JSON backup** regularly, then use **Import JSON backup** on another device. Import validates the backup and asks before it replaces local data.
+Data remains on the device/browser where it was created. It does **not** automatically synchronize between phones and computers. Open **Settings → Export** regularly, then use **Import** on another device. Import validates the backup and asks before it replaces local data.
 
 ## Calculation behavior
 
-- Yonex 4-Knot is calculated as `11 × racket length + 2 × end-to-T-head length` (default: **8.285m**).
-- SZ 2-Knot is calculated as `11.5 × racket length` (default: **7.7625m**).
-- Remaining inventory is always `original roll length − confirmed job consumption`; editing or deleting a job recalculates it, avoiding double deductions.
-- The planned 11 four-knot + 14 two-knot combination is shown per roll as guidance, never enforced.
+- YY (Yonex 4-knot) uses `11 × racket length + 2 × end-to-T-head length` (default: **8.285 m**).
+- SZ (2-knot) uses `11.5 × racket length` (default: **7.7625 m**).
+- Remaining string is always `roll length − string used before tracking − logged rackets`; editing or deleting an entry recalculates it.
+- New rolls start at the "New roll length" from Settings (default 200 m).
+- The "left" counts on the YY and SZ buttons are the combination that fits the most rackets in the remaining string, with YY prioritized. It is guidance, never enforced.
+- A roll is "Finished" once it cannot fit one more racket, and "Low" below the warning length in Settings.
 
 ## Deploy free on Cloudflare Pages
 
