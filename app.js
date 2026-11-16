@@ -307,8 +307,10 @@ function rollForm(id) {
       <label class="field full">Bought on<input type="date" name="purchaseDate" value="${esc(r?.purchaseDate || '')}"></label>
       <label class="field full">Notes<textarea name="notes" rows="2">${esc(r?.notes || '')}</textarea></label>
     </div></details>
-    <div class="modal-foot"><button type="button" class="btn" data-act="close">Cancel</button><button class="btn primary">${r ? 'Save' : 'Add roll'}</button></div>
+    <div class="modal-foot">${r ? '<button type="button" class="btn danger left" id="deleteRoll">Delete</button>' : ''}<button type="button" class="btn" data-act="close">Cancel</button><button class="btn primary">${r ? 'Save' : 'Add roll'}</button></div>
   </form>`);
+  if (r) $('#deleteRoll').onclick = () => deleteRoll(r);
+  else $('#rollForm').elements.brand.focus();
   $('#rollForm').addEventListener('submit', async e => {
     e.preventDefault();
     const f = Object.fromEntries(new FormData(e.currentTarget));
@@ -320,10 +322,24 @@ function rollForm(id) {
     else {
       const number = String(Math.max(0, ...state.rolls.map(x => Number(x.rollCode?.match(/\d+/)?.[0]) || 0)) + 1).padStart(3, '0');
       await put('rolls', { id: uid('roll'), rollCode: `Roll #${number}`, ...fields, archived: false, empty: false, createdAt: new Date().toISOString() });
+      // Ask the browser not to evict this data when the device runs low on space.
+      navigator.storage?.persist?.().catch(() => {});
     }
     closeModal();
     await refresh();
     toast(r ? 'Roll updated.' : 'Roll added.');
+  });
+}
+
+function deleteRoll(r) {
+  const count = jobsFor(r.id).length;
+  confirmModal('Delete this roll?', `${esc(rollName(r))} ${count ? `and its ${count} logged racket${count === 1 ? '' : 's'} ` : ''}will be permanently deleted. To keep the history, archive the roll instead.`, 'Delete', async () => {
+    for (const j of jobsFor(r.id)) await remove('jobs', j.id);
+    await remove('rolls', r.id);
+    closeModal();
+    await load();
+    if (location.hash === '#/' || !location.hash) render(); else location.hash = '#/';
+    toast('Roll deleted.');
   });
 }
 
