@@ -114,7 +114,7 @@ function logButtons(r) {
   if (r.archived) return '';
   if (isFinished(r)) return `<div class="finished-note"><span>Not enough left for another racket.</span><button class="btn small" data-act="archive" data-id="${r.id}">Archive</button></div>`;
   const p = plan(remaining(r)), rem = remaining(r);
-  const button = key => `<button class="log" data-act="log" data-method="${key}" data-id="${r.id}" ${rem + 1e-9 < consumption(key) ? 'disabled' : ''} aria-label="Log a ${METHODS[key].name} racket on ${esc(rollName(r))}">${ICON.plus}<b>${METHODS[key].name}</b><small>${p[key]} left</small></button>`;
+  const button = key => `<button class="log" data-act="log" data-method="${key}" data-id="${r.id}" ${p[key] < 1 || rem + 1e-9 < consumption(key) ? 'disabled' : ''} aria-label="Log a ${METHODS[key].name} racket on ${esc(rollName(r))}">${ICON.plus}<b>${METHODS[key].name}</b><small>${p[key]} left</small></button>`;
   return `<div class="log-row">${button('four')}${button('two')}</div>`;
 }
 function rollCard(r) {
