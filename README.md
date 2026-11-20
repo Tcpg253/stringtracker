@@ -16,13 +16,20 @@ Then open `http://localhost:8080` in a modern browser. The app will be usable of
 
 Data remains on the device/browser where it was created. It does **not** automatically synchronize between phones and computers. Open **Settings → Export** regularly, then use **Import** on another device. Import validates the backup and asks before it replaces local data.
 
+## Stringing methods
+
+Methods are set up in **Settings → Stringing methods**. Each one has a name and a vertical and horizontal part, built by tapping length buttons:
+
+- **Racket length** and **End to T-head** use the measurements in Settings (default 67.5 cm and 43 cm).
+- **½ racket** is half the racket length.
+
+The defaults reproduce the original methods: YY = 11 racket lengths + 2 end-to-T-head (**8.285 m**), SZ = 11.5 racket lengths (**7.7625 m**). Changing a method or a measurement only affects rackets logged afterwards; each logged entry keeps the amount it deducted. Switch a method off to hide it from the roll cards, or delete it; its past entries stay in the history under its name.
+
 ## Calculation behavior
 
-- YY (Yonex 4-knot) uses `11 × racket length + 2 × end-to-T-head length` (default: **8.285 m**).
-- SZ (2-knot) uses `11.5 × racket length` (default: **7.7625 m**).
 - Remaining string is always `roll length − string used before tracking − logged rackets`; editing or deleting an entry recalculates it.
 - New rolls start at the "New roll length" from Settings (default 200 m).
-- The "left" counts on the YY and SZ buttons are the combination that fits the most rackets in the remaining string, with YY prioritized. It is guidance, never enforced.
+- The "left" count on each log button comes from splitting the remaining string across the methods that are switched on: the most rackets possible, favouring the method at the top of the list. A button goes gray when that split has none of it left. It is guidance, never enforced.
 - A roll is "Finished" once it cannot fit one more racket, and "Low" below the warning length in Settings.
 
 ## Deploy free on Cloudflare Pages
