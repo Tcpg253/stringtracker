@@ -1,10 +1,20 @@
 /* StringTracker: private, offline-first, no accounts or external services. */
 const DB_NAME = 'stringtracker-db', DB_VERSION = 1;
-const METHODS = {
-  four: { name: 'YY', racketUnits: 11, endUnits: 2 },
-  two: { name: 'SZ', racketUnits: 11.5, endUnits: 0 },
+// The length pieces a stringing method is built from. Values come from the measurements in Settings.
+const UNITS = {
+  racket: { label: 'Racket length', cm: () => state.settings.racketLength },
+  half: { label: '½ racket', cm: () => state.settings.racketLength / 2 },
+  end: { label: 'End to T-head', cm: () => state.settings.endLength },
 };
-const DEFAULT_SETTINGS = { defaultLength: 200, racketLength: 67.5, endLength: 43, lowWarning: 20, criticalWarning: 10, defaultMethod: 'four', theme: 'auto', lastBackupAt: null };
+const PARTS = { vertical: 'Vertical', horizontal: 'Horizontal' };
+const LEGACY_NAMES = { four: 'YY', two: 'SZ' };
+const counts = c => Object.fromEntries(Object.keys(UNITS).map(k => [k, Math.max(0, Math.round(Number(c?.[k]) || 0))]));
+// Same totals as the original built-in methods: YY = 11 racket + 2 T-head, SZ = 11.5 racket.
+const defaultMethods = () => [
+  { id: 'four', name: 'YY', active: true, vertical: counts({ racket: 6, end: 1 }), horizontal: counts({ racket: 5, end: 1 }) },
+  { id: 'two', name: 'SZ', active: true, vertical: counts({ racket: 6 }), horizontal: counts({ racket: 5, half: 1 }) },
+];
+const DEFAULT_SETTINGS = { defaultLength: 200, racketLength: 67.5, endLength: 43, lowWarning: 20, criticalWarning: 10, theme: 'auto', lastBackupAt: null };
 
 let db, deferredInstall, busy = false;
 const state = { rolls: [], jobs: [], settings: { ...DEFAULT_SETTINGS }, page: 'home', rollId: null, jobQuery: '', jobMethod: '' };
@@ -31,6 +41,7 @@ function dateFmt(d) {
 const ICON = {
   plus: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
   back: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg>',
+  up: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 15 6-6 6 6"/></svg>',
   chevron: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>',
 };
 
@@ -57,16 +68,29 @@ async function load() {
   state.jobs = await getAll('jobs');
   const stored = await getAll('settings');
   state.settings = { ...DEFAULT_SETTINGS, ...(stored[0]?.value || {}) };
+  state.settings.methods = normalizeMethods(state.settings.methods);
   applyTheme();
 }
 const saveSettings = () => put('settings', { id: 'preferences', value: state.settings });
 
 /* ---------- calculations ---------- */
-function consumption(key) {
-  const m = METHODS[key];
-  return (m.racketUnits * state.settings.racketLength + m.endUnits * state.settings.endLength) / 100;
+function normalizeMethods(list) {
+  if (!Array.isArray(list)) return defaultMethods();
+  return list.filter(m => m && m.id).map(m => ({ id: String(m.id), name: String(m.name || 'Method'), active: m.active !== false, vertical: counts(m.vertical), horizontal: counts(m.horizontal) }));
 }
-const minConsumption = () => Math.min(consumption('four'), consumption('two'));
+const methods = () => state.settings.methods;
+const methodFor = id => methods().find(m => m.id === id);
+const partLength = c => Object.entries(UNITS).reduce((sum, [k, u]) => sum + n(c?.[k]) * u.cm(), 0) / 100;
+const methodLength = m => partLength(m.vertical) + partLength(m.horizontal);
+const activeMethods = () => methods().filter(m => m.active && methodLength(m) > 0);
+const consumption = id => { const m = methodFor(id); return m ? methodLength(m) : 0; };
+// A deleted method's entries keep the name they were logged with.
+const methodName = (id, job) => methodFor(id)?.name || job?.methodName || LEGACY_NAMES[id] || id;
+function minConsumption() {
+  const pool = activeMethods().length ? activeMethods() : methods();
+  const list = pool.map(methodLength).filter(c => c > 0);
+  return list.length ? Math.min(...list) : 0;
+}
 const rollFor = id => state.rolls.find(r => r.id === id);
 const jobsFor = id => state.jobs.filter(j => j.rollId === id);
 const logged = id => jobsFor(id).reduce((sum, j) => sum + n(j.consumption), 0);
@@ -76,15 +100,26 @@ const original = r => isLegacy(r) ? 200 : (n(r.originalLength) || 200);
 const openingUsed = r => isLegacy(r) ? 200 - n(r.originalLength) : n(r.openingUsed);
 const used = r => openingUsed(r) + logged(r.id);
 const remaining = r => Math.max(0, original(r) - used(r));
-const isFinished = r => remaining(r) + 1e-9 < minConsumption();
+const isFinished = r => remaining(r) <= 1e-9 || remaining(r) + 1e-9 < minConsumption();
 const isLow = r => !isFinished(r) && remaining(r) < state.settings.lowWarning;
-// Most rackets that fit in `length`, using as many YY as possible without reducing the total.
+// Split `length` across the active methods: the most rackets possible, then as many of the
+// top-listed method as that allows, then the next, and so on.
 function plan(length) {
-  const a = consumption('four'), b = consumption('two');
-  if (!(a > 0 && b > 0)) return { four: 0, two: 0, total: 0 };
-  const total = Math.floor((length + 1e-9) / Math.min(a, b));
-  const four = a > b ? Math.max(0, Math.min(total, Math.floor((length - total * b + 1e-9) / (a - b)))) : total;
-  return { four, two: total - four, total };
+  const list = activeMethods(), result = { total: 0, counts: {} };
+  if (!list.length) return result;
+  const cost = list.map(methodLength);
+  let left = length, toPlace = Math.floor((length + 1e-9) / Math.min(...cost));
+  result.total = toPlace;
+  list.forEach((m, i) => {
+    const rest = cost.slice(i + 1), cheapest = rest.length ? Math.min(...rest) : null;
+    // The rackets still to place after this method must fit using the cheapest method below it.
+    const k = cheapest == null || cost[i] <= cheapest ? toPlace
+      : Math.max(0, Math.min(toPlace, Math.floor((left - toPlace * cheapest + 1e-9) / (cost[i] - cheapest))));
+    result.counts[m.id] = k;
+    toPlace -= k;
+    left -= k * cost[i];
+  });
+  return result;
 }
 const activeRolls = () => state.rolls.filter(r => !r.archived)
   .sort((a, b) => Number(isFinished(a)) - Number(isFinished(b)) || String(b.createdAt).localeCompare(String(a.createdAt)));
@@ -113,9 +148,14 @@ function statusPill(r) {
 function logButtons(r) {
   if (r.archived) return '';
   if (isFinished(r)) return `<div class="finished-note"><span>Not enough left for another racket.</span><button class="btn small" data-act="archive" data-id="${r.id}">Archive</button></div>`;
+  const list = activeMethods();
+  if (!list.length) return `<div class="finished-note"><span>No stringing methods are turned on.</span><a class="btn small" href="#/settings">Settings</a></div>`;
   const p = plan(remaining(r)), rem = remaining(r);
-  const button = key => `<button class="log" data-act="log" data-method="${key}" data-id="${r.id}" ${p[key] < 1 || rem + 1e-9 < consumption(key) ? 'disabled' : ''} aria-label="Log a ${METHODS[key].name} racket on ${esc(rollName(r))}">${ICON.plus}<b>${METHODS[key].name}</b><small>${p[key]} left</small></button>`;
-  return `<div class="log-row">${button('four')}${button('two')}</div>`;
+  const button = m => {
+    const left = p.counts[m.id] || 0;
+    return `<button class="log" data-act="log" data-method="${esc(m.id)}" data-id="${r.id}" ${left < 1 || rem + 1e-9 < methodLength(m) ? 'disabled' : ''} aria-label="Log a ${esc(m.name)} racket on ${esc(rollName(r))}">${ICON.plus}<b>${esc(m.name)}</b><small>${left} left</small></button>`;
+  };
+  return `<div class="log-row">${list.map(button).join('')}</div>`;
 }
 function rollCard(r) {
   const sub = rollSub(r);
@@ -141,7 +181,7 @@ function jobRow(j, showRoll) {
   const racket = `${j.racketBrand || ''} ${j.racketModel || ''}`.trim();
   const title = showRoll ? (r ? rollName(r) : 'Deleted roll') : dateFmt(j.date);
   const sub = [showRoll ? dateFmt(j.date) : '', j.tension, racket].filter(Boolean).join(' · ');
-  return `<button class="row" data-act="edit-job" data-id="${j.id}"><span class="row-main"><strong>${esc(title)}</strong>${sub ? `<small>${esc(sub)}</small>` : ''}</span><span class="pill">${esc(METHODS[j.method]?.name || j.method)}</span></button>`;
+  return `<button class="row" data-act="edit-job" data-id="${j.id}"><span class="row-main"><strong>${esc(title)}</strong>${sub ? `<small>${esc(sub)}</small>` : ''}</span><span class="pill">${esc(methodName(j.method, j))}</span></button>`;
 }
 function filteredJobs() {
   const q = state.jobQuery.trim().toLowerCase();
@@ -152,14 +192,24 @@ function filteredJobs() {
     return `${r ? rollName(r) : ''} ${j.racketBrand || ''} ${j.racketModel || ''} ${j.tension || ''} ${j.notes || ''}`.toLowerCase().includes(q);
   }));
 }
+// Methods that appear in the history, in the order of the methods list.
+function usedMethodIds(jobs = state.jobs) {
+  const seen = new Set(jobs.map(j => j.method));
+  const ordered = methods().map(m => m.id).filter(id => seen.has(id));
+  seen.forEach(id => { if (!ordered.includes(id)) ordered.push(id); });
+  return ordered;
+}
+const usedName = (id, jobs = state.jobs) => methodName(id, jobs.find(j => j.method === id));
 const jobList = () => { const list = filteredJobs(); return list.length ? list.map(j => jobRow(j, true)).join('') : '<p class="hint pad">Nothing matches.</p>'; };
 function seg(act, current, options) {
-  return `<div class="seg">${options.map(([value, label]) => `<button data-act="${act}" data-value="${value}" aria-pressed="${value === current}">${label}</button>`).join('')}</div>`;
+  return `<div class="seg">${options.map(([value, label]) => `<button data-act="${act}" data-value="${esc(value)}" aria-pressed="${value === current}">${esc(label)}</button>`).join('')}</div>`;
 }
 function history() {
   if (!state.jobs.length) return `<div class="page-head"><h1>History</h1></div>${emptyState('Nothing logged yet', 'Rackets you log from a roll will show up here.')}`;
+  const ids = usedMethodIds();
+  if (!ids.includes(state.jobMethod)) state.jobMethod = '';
   return `<div class="page-head"><h1>History</h1></div>
-    <div class="filters"><input type="search" id="jobSearch" placeholder="Search" aria-label="Search history" value="${esc(state.jobQuery)}">${seg('filter-method', state.jobMethod, [['', 'All'], ['four', 'YY'], ['two', 'SZ']])}</div>
+    <div class="filters"><input type="search" id="jobSearch" placeholder="Search" aria-label="Search history" value="${esc(state.jobQuery)}">${ids.length > 1 ? seg('filter-method', state.jobMethod, [['', 'All'], ...ids.map(id => [id, usedName(id)])]) : ''}</div>
     <div class="card list" id="jobRows">${jobList()}</div>
     <p class="hint">Tap an entry to edit or delete it.</p>`;
 }
@@ -182,20 +232,35 @@ function stats() {
       <div class="card tile"><strong>${num(consumed / count)}<i> m</i></strong><span>per racket</span></div>
     </div>
     <div class="card facts">
-      ${kv('YY rackets', of('four'))}${kv('SZ rackets', of('two'))}
+      ${usedMethodIds().map(id => kv(`${esc(usedName(id))} rackets`, of(id))).join('')}
       ${popular ? kv('Most used string', esc(popular)) : ''}
       ${kv('Rolls finished', state.rolls.filter(isFinished).length)}
     </div>`;
 }
 
-const perRacketText = () => `YY uses <strong>${meters(consumption('four'))}</strong> and SZ uses <strong>${meters(consumption('two'))}</strong> per racket.`;
+function methodRows() {
+  const list = methods();
+  if (!list.length) return '<p class="hint pad">No methods yet. Add one to start logging.</p>';
+  return list.map((m, i) => `<div class="row method-row">
+    <button class="row-main method-open" data-act="edit-method" data-id="${esc(m.id)}"><strong>${esc(m.name)}</strong><small>${meters(methodLength(m))} per racket</small></button>
+    ${i ? `<button class="icon-btn" data-act="method-up" data-id="${esc(m.id)}" aria-label="Move ${esc(m.name)} up">${ICON.up}</button>` : ''}
+    <button class="switch" role="switch" aria-checked="${m.active}" data-act="method-toggle" data-id="${esc(m.id)}" aria-label="Show ${esc(m.name)} on roll cards"><span></span></button>
+  </div>`).join('');
+}
 function settings() {
   const s = state.settings;
   const field = (key, label, step, min) => `<label class="field">${label}<input type="number" inputmode="decimal" min="${min}" step="${step}" data-setting="${key}" value="${s[key]}"></label>`;
   return `<div class="page-head"><h1>Settings</h1></div>
+    <section class="card section">
+      <div class="section-head"><h2>Stringing methods</h2><button class="btn small" data-act="add-method">${ICON.plus}Add</button></div>
+      <p class="hint">Tap a method to edit it. Switch one off to hide it from your rolls. When a roll is split between methods, the top one gets priority.</p>
+      <div class="list inset" id="methodList">${methodRows()}</div>
+    </section>
     <section class="card section"><h2>Measurements</h2>
-      <div class="form-grid">${field('racketLength', 'Racket length (cm)', '0.01', '1')}${field('endLength', 'End to T-head (cm)', '0.01', '0')}${field('defaultLength', 'New roll length (m)', '1', '1')}${field('lowWarning', 'Low warning below (m)', '1', '0')}</div>
-      <p class="hint" id="perRacket">${perRacketText()}</p>
+      <div class="form-grid">${field('racketLength', 'Racket length (cm)', '0.01', '1')}${field('endLength', 'End to T-head (cm)', '0.01', '0')}</div>
+    </section>
+    <section class="card section"><h2>Rolls</h2>
+      <div class="form-grid">${field('defaultLength', 'New roll length (m)', '1', '1')}${field('lowWarning', 'Low warning below (m)', '1', '0')}</div>
     </section>
     <section class="card section"><h2>Appearance</h2>${seg('theme', s.theme === 'light' || s.theme === 'dark' ? s.theme : 'auto', [['auto', 'Auto'], ['light', 'Light'], ['dark', 'Dark']])}</section>
     <section class="card section"><h2>Backup</h2>
@@ -224,7 +289,7 @@ function rollDetail() {
       ${logButtons(r)}
     </section>
     <section class="card facts">
-      ${kv('Rackets strung', jobs.length ? `${jobs.length} <small>(${of('four')} YY · ${of('two')} SZ)</small>` : '0')}
+      ${kv('Rackets strung', jobs.length ? `${jobs.length} <small>(${usedMethodIds(jobs).map(id => `${of(id)} ${esc(usedName(id, jobs))}`).join(' · ')})</small>` : '0')}
       ${n(r.price) > 0 && fullPlan ? kv('String cost per racket', `¥${(n(r.price) / fullPlan).toFixed(2)}`) : ''}
       ${r.purchaseDate ? kv('Bought', dateFmt(r.purchaseDate)) : ''}
       ${r.notes ? `<p class="notes">${esc(r.notes)}</p>` : ''}
@@ -279,14 +344,15 @@ async function refresh() { await load(); render(); }
 
 async function logRacket(rollId, method) {
   if (busy) return;
-  const r = rollFor(rollId), c = consumption(method);
-  if (!r || remaining(r) + 1e-9 < c) { toast('Not enough string on this roll.'); return; }
+  const r = rollFor(rollId), m = methodFor(method), c = m ? methodLength(m) : 0;
+  if (!r || !m || c <= 0) return;
+  if (remaining(r) + 1e-9 < c) { toast('Not enough string on this roll.'); return; }
   busy = true;
   try {
-    const job = { id: uid('job'), rollId, method, date: today(), consumption: c, racketBrand: '', racketModel: '', tension: '', notes: '', createdAt: new Date().toISOString() };
+    const job = { id: uid('job'), rollId, method, methodName: m.name, date: today(), consumption: c, racketBrand: '', racketModel: '', tension: '', notes: '', createdAt: new Date().toISOString() };
     await put('jobs', job);
     await refresh();
-    toast(`${METHODS[method].name} racket logged`, 'Undo', async () => { await remove('jobs', job.id); await refresh(); toast('Removed.'); });
+    toast(`${m.name} racket logged`, 'Undo', async () => { await remove('jobs', job.id); await refresh(); toast('Removed.'); });
   } catch (e) { toast('Could not save. Please try again.'); }
   busy = false;
 }
@@ -354,12 +420,14 @@ function jobForm(jobId) {
   if (!j) return;
   const r = rollFor(j.rollId);
   if (!r) { confirmModal('Delete this entry?', 'Its roll no longer exists.', 'Delete', () => deleteJob(j)); return; }
-  const option = key => `<option value="${key}" ${j.method === key ? 'selected' : ''}>${METHODS[key].name}</option>`;
+  const choices = methods().map(m => [m.id, m.name]);
+  if (!methodFor(j.method)) choices.push([j.method, methodName(j.method, j)]);
+  const options = choices.map(([id, name]) => `<option value="${esc(id)}" ${j.method === id ? 'selected' : ''}>${esc(name)}</option>`).join('');
   const extras = j.racketBrand || j.racketModel || j.notes;
   modal('Edit entry', `<p class="modal-text">${esc(rollName(r))}</p><form id="jobForm">
     <div class="form-grid">
       <label class="field">Date<input required type="date" name="date" value="${esc(j.date || today())}"></label>
-      <label class="field">Method<select name="method">${option('four')}${option('two')}</select></label>
+      <label class="field">Method<select name="method">${options}</select></label>
       <label class="field full">Tension<input name="tension" value="${esc(j.tension || '')}" placeholder="e.g. 26 lbs"></label>
     </div>
     <details class="more" ${extras ? 'open' : ''}><summary>More details</summary><div class="form-grid">
@@ -371,18 +439,80 @@ function jobForm(jobId) {
     <div class="modal-foot"><button type="button" class="btn danger left" id="deleteJob">Delete</button><button type="button" class="btn" data-act="close">Cancel</button><button class="btn primary">Save</button></div>
   </form>`);
   const form = $('#jobForm');
-  form.elements.method.addEventListener('change', () => { form.elements.amount.value = consumption(form.elements.method.value); });
+  form.elements.method.addEventListener('change', () => { const c = consumption(form.elements.method.value); if (c > 0) form.elements.amount.value = round4(c); });
   $('#deleteJob').onclick = () => deleteJob(j);
   form.addEventListener('submit', async e => {
     e.preventDefault();
     const f = Object.fromEntries(new FormData(form));
     const amount = n(f.amount), others = used(r) - n(j.consumption);
     if (amount <= 0 || others + amount > original(r) + 1e-9) { toast('That is more string than this roll has left.'); return; }
-    await put('jobs', { ...j, method: f.method, date: f.date, tension: f.tension.trim(), racketBrand: f.racketBrand.trim(), racketModel: f.racketModel.trim(), notes: f.notes.trim(), consumption: amount, updatedAt: new Date().toISOString() });
+    await put('jobs', { ...j, method: f.method, methodName: methodName(f.method, j), date: f.date, tension: f.tension.trim(), racketBrand: f.racketBrand.trim(), racketModel: f.racketModel.trim(), notes: f.notes.trim(), consumption: amount, updatedAt: new Date().toISOString() });
     closeModal();
     await refresh();
     toast('Saved.');
   });
+}
+
+/* ---------- stringing methods ---------- */
+let draft = null;
+function partEditor(part) {
+  const c = draft[part], len = partLength(c);
+  const chips = Object.entries(UNITS).filter(([k]) => c[k] > 0).map(([k, u]) =>
+    `<span class="chip">${c[k]} × ${u.label}<button type="button" data-act="unit-sub" data-part="${part}" data-unit="${k}" aria-label="Remove one ${u.label} from ${PARTS[part]}">−</button></span>`).join('');
+  return `<div class="part-head"><h3>${PARTS[part]}</h3><span>${len ? meters(len) : ''}</span></div>
+    <div class="chips">${chips || '<span class="hint-inline">Tap the buttons below to add lengths.</span>'}</div>
+    <div class="unit-row">${Object.entries(UNITS).map(([k, u]) =>
+      `<button type="button" class="unit" data-act="unit-add" data-part="${part}" data-unit="${k}" aria-label="Add one ${u.label} to ${PARTS[part]}">${ICON.plus}<span>${u.label}</span><small>${num(u.cm())} cm</small></button>`).join('')}</div>`;
+}
+const methodTotal = () => `Total <strong>${meters(methodLength(draft))}</strong> per racket`;
+function changeUnit(el, delta) {
+  const { part, unit } = el.dataset;
+  draft[part][unit] = Math.max(0, draft[part][unit] + delta);
+  $(`.part[data-part="${part}"]`).innerHTML = partEditor(part);
+  $('#methodTotal').innerHTML = methodTotal();
+}
+function methodForm(id) {
+  const m = id ? methodFor(id) : null;
+  draft = m ? structuredClone(m) : { id: uid('method'), name: '', active: true, vertical: counts(), horizontal: counts() };
+  modal(m ? 'Edit method' : 'Add method', `<form id="methodForm">
+    <label class="field">Name<input required name="name" maxlength="24" value="${esc(draft.name)}" placeholder="e.g. YY 4-knot" autocomplete="off"></label>
+    ${Object.keys(PARTS).map(part => `<div class="part" data-part="${part}">${partEditor(part)}</div>`).join('')}
+    <div class="method-total" id="methodTotal">${methodTotal()}</div>
+    <label class="check"><input type="checkbox" name="active" ${draft.active ? 'checked' : ''}>Show on roll cards</label>
+    <div class="modal-foot">${m ? '<button type="button" class="btn danger left" id="deleteMethod">Delete</button>' : ''}<button type="button" class="btn" data-act="close">Cancel</button><button class="btn primary">Save</button></div>
+  </form>`);
+  const form = $('#methodForm');
+  if (!m) form.elements.name.focus();
+  if (m) $('#deleteMethod').onclick = () => deleteMethod(m);
+  form.addEventListener('submit', async e => {
+    e.preventDefault();
+    draft.name = form.elements.name.value.trim();
+    draft.active = form.elements.active.checked;
+    if (!draft.name) { toast('Give the method a name.'); return; }
+    if (methodLength(draft) <= 0) { toast('Add at least one length.'); return; }
+    const list = methods(), i = list.findIndex(x => x.id === draft.id);
+    if (i >= 0) list[i] = draft; else list.push(draft);
+    await saveSettings();
+    closeModal();
+    render();
+    toast(m ? 'Method saved.' : 'Method added.');
+  });
+}
+function deleteMethod(m) {
+  const count = state.jobs.filter(j => j.method === m.id).length;
+  confirmModal('Delete this method?', `${esc(m.name)} will be removed.${count ? ` The ${count === 1 ? 'racket' : `${count} rackets`} logged with it ${count === 1 ? 'stays' : 'stay'} in your history.` : ''}`, 'Delete', async () => {
+    for (const j of state.jobs.filter(j => j.method === m.id)) await put('jobs', { ...j, methodName: m.name });
+    state.settings.methods = methods().filter(x => x.id !== m.id);
+    await saveSettings();
+    closeModal();
+    await refresh();
+    toast('Method deleted.');
+  });
+}
+async function updateMethods(change) {
+  change(methods());
+  await saveSettings();
+  $('#methodList').innerHTML = methodRows();
 }
 
 async function toggleArchive(id) {
@@ -446,6 +576,12 @@ const ACTIONS = {
   'export': exportData,
   'import': () => $('#importFile').click(),
   'reset': resetData,
+  'add-method': () => methodForm(),
+  'edit-method': el => methodForm(el.dataset.id),
+  'method-toggle': el => updateMethods(list => { const m = list.find(x => x.id === el.dataset.id); if (m) m.active = !m.active; }),
+  'method-up': el => updateMethods(list => { const i = list.findIndex(x => x.id === el.dataset.id); if (i > 0) list.splice(i - 1, 0, ...list.splice(i, 1)); }),
+  'unit-add': el => changeUnit(el, 1),
+  'unit-sub': el => changeUnit(el, -1),
   'install': async () => { if (!deferredInstall) return; deferredInstall.prompt(); await deferredInstall.userChoice; deferredInstall = null; render(); },
 };
 document.addEventListener('click', e => {
@@ -464,7 +600,7 @@ document.addEventListener('change', async e => {
   if (el.value.trim() === '' || value < n(el.min)) { el.value = state.settings[key]; toast('Enter a valid number.'); return; }
   state.settings[key] = value;
   await saveSettings();
-  $('#perRacket').innerHTML = perRacketText();
+  $('#methodList').innerHTML = methodRows();
   toast('Saved.');
 });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
