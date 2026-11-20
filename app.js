@@ -473,7 +473,7 @@ function changeUnit(el, delta) {
 }
 function methodForm(id) {
   const m = id ? methodFor(id) : null;
-  draft = m ? structuredClone(m) : { id: uid('method'), name: '', active: true, vertical: counts(), horizontal: counts() };
+  draft = m ? JSON.parse(JSON.stringify(m)) : { id: uid('method'), name: '', active: true, vertical: counts(), horizontal: counts() };
   modal(m ? 'Edit method' : 'Add method', `<form id="methodForm">
     <label class="field">Name<input required name="name" maxlength="24" value="${esc(draft.name)}" placeholder="e.g. YY 4-knot" autocomplete="off"></label>
     ${Object.keys(PARTS).map(part => `<div class="part" data-part="${part}">${partEditor(part)}</div>`).join('')}
