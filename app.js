@@ -611,13 +611,31 @@ window.addEventListener('online', syncOffline);
 window.addEventListener('offline', syncOffline);
 window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); deferredInstall = e; if (state.page === 'settings') render(); });
 
+// Show a new version as soon as it is downloaded, instead of on some later launch.
+function registerWorker() {
+  if (!('serviceWorker' in navigator)) return;
+  // The first takeover after a fresh install is not an update, so it needs no reload.
+  let controlled = !!navigator.serviceWorker.controller, reloading = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!controlled) { controlled = true; return; }
+    if (reloading) return;
+    if ($('#modalRoot').innerHTML) { toast('A new version is ready', 'Reload', () => location.reload()); return; }
+    reloading = true;
+    location.reload();
+  });
+  navigator.serviceWorker.register('./sw.js').then(reg => {
+    // An app on the iPhone home screen resumes without reloading, so check for updates when it comes back.
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') reg.update().catch(() => {}); });
+  }).catch(() => {});
+}
+
 (async function init() {
   try {
     db = await openDB();
     await load();
     route();
     syncOffline();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
+    registerWorker();
   } catch (err) {
     $('#app').innerHTML = emptyState('Storage could not start', `StringTracker needs browser storage (IndexedDB) enabled. ${esc(err.message)}`);
   }
